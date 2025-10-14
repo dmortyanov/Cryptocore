@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+cryptocore
+*.o
+*.exe
+
+# Test files
+tests/*.txt
+tests/*.bin
+tests/*.enc
+tests/*.dec
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+
