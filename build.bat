@@ -24,7 +24,7 @@ REM Создание директории сборки
 if not exist build mkdir build
 
 echo Компиляция main.c...
-gcc -Wall -Wextra -O2 -I. -c main.c -o build\main.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c main.c -o build\main.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать main.c
     pause
@@ -32,7 +32,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\ecb.c...
-gcc -Wall -Wextra -O2 -I. -c src\ecb.c -o build\ecb.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\ecb.c -o build\ecb.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\ecb.c
     pause
@@ -40,7 +40,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\file_io.c...
-gcc -Wall -Wextra -O2 -I. -c src\file_io.c -o build\file_io.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\file_io.c -o build\file_io.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\file_io.c
     pause
@@ -48,7 +48,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\modes\cbc.c...
-gcc -Wall -Wextra -O2 -I. -c src\modes\cbc.c -o build\cbc.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\modes\cbc.c -o build\cbc.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\modes\cbc.c
     pause
@@ -56,7 +56,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\modes\cfb.c...
-gcc -Wall -Wextra -O2 -I. -c src\modes\cfb.c -o build\cfb.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\modes\cfb.c -o build\cfb.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\modes\cfb.c
     pause
@@ -64,7 +64,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\modes\ofb.c...
-gcc -Wall -Wextra -O2 -I. -c src\modes\ofb.c -o build\ofb.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\modes\ofb.c -o build\ofb.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\modes\ofb.c
     pause
@@ -72,7 +72,7 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\modes\ctr.c...
-gcc -Wall -Wextra -O2 -I. -c src\modes\ctr.c -o build\ctr.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\modes\ctr.c -o build\ctr.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\modes\ctr.c
     pause
@@ -80,15 +80,31 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo Компиляция src\modes\utils.c...
-gcc -Wall -Wextra -O2 -I. -c src\modes\utils.c -o build\utils.o
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\modes\utils.c -o build\utils.o
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось скомпилировать src\modes\utils.c
     pause
     exit /b 1
 )
 
+echo Компиляция src\mouse_entropy.c...
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\mouse_entropy.c -o build\mouse_entropy.o
+if %ERRORLEVEL% NEQ 0 (
+    echo Ошибка: Не удалось скомпилировать src\mouse_entropy.c
+    pause
+    exit /b 1
+)
+
+echo Компиляция src\csprng.c...
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\csprng.c -o build\csprng.o
+if %ERRORLEVEL% NEQ 0 (
+    echo Ошибка: Не удалось скомпилировать src\csprng.c
+    pause
+    exit /b 1
+)
+
 echo Линковка...
-gcc build\main.o build\ecb.o build\file_io.o build\cbc.o build\cfb.o build\ofb.o build\ctr.o build\utils.o -o cryptocore.exe -lcrypto
+gcc build\main.o build\ecb.o build\file_io.o build\cbc.o build\cfb.o build\ofb.o build\ctr.o build\utils.o build\mouse_entropy.o build\csprng.o -o cryptocore.exe -lcrypto -lbcrypt
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось выполнить линковку. Убедитесь, что OpenSSL установлен.
     echo.

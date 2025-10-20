@@ -1,8 +1,8 @@
 # CryptoCore Makefile
 # Компилятор и флаги
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -I.
-LDFLAGS = -lcrypto
+CFLAGS = -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8
+LDFLAGS = -lcrypto -lbcrypt
 
 # Директории
 SRC_DIR = src
@@ -20,7 +20,9 @@ SOURCES = main.c \
           $(MODES_DIR)/cfb.c \
           $(MODES_DIR)/ofb.c \
           $(MODES_DIR)/ctr.c \
-          $(MODES_DIR)/utils.c
+          $(MODES_DIR)/utils.c \
+          $(SRC_DIR)/mouse_entropy.c \
+          $(SRC_DIR)/csprng.c
 
 # Объектные файлы
 OBJECTS = $(BUILD_DIR)/main.o \
@@ -30,7 +32,9 @@ OBJECTS = $(BUILD_DIR)/main.o \
           $(BUILD_DIR)/cfb.o \
           $(BUILD_DIR)/ofb.o \
           $(BUILD_DIR)/ctr.o \
-          $(BUILD_DIR)/utils.o
+          $(BUILD_DIR)/utils.o \
+          $(BUILD_DIR)/mouse_entropy.o \
+          $(BUILD_DIR)/csprng.o
 
 # Цель по умолчанию
 all: $(BUILD_DIR) $(TARGET)
@@ -75,6 +79,12 @@ $(BUILD_DIR)/ctr.o: $(MODES_DIR)/ctr.c include/modes.h include/ecb.h
 # Компиляция utils.c
 $(BUILD_DIR)/utils.o: $(MODES_DIR)/utils.c include/modes.h
 	$(CC) $(CFLAGS) -c $(MODES_DIR)/utils.c -o $(BUILD_DIR)/utils.o
+
+$(BUILD_DIR)/mouse_entropy.o: src/mouse_entropy.c include/mouse_entropy.h
+	$(CC) $(CFLAGS) -c src/mouse_entropy.c -o $(BUILD_DIR)/mouse_entropy.o
+
+$(BUILD_DIR)/csprng.o: src/csprng.c include/csprng.h
+	$(CC) $(CFLAGS) -c src/csprng.c -o $(BUILD_DIR)/csprng.o
 
 # Очистка артефактов сборки
 clean:
