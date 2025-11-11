@@ -14,7 +14,7 @@ int generate_random_bytes(unsigned char *buffer, size_t num_bytes) {
     
     // Используем OpenSSL RAND_bytes для криптографически стойкой генерации
     if (RAND_bytes(buffer, (int)num_bytes) != 1) {
-        fprintf(stderr, "Ошибка: Не удалось сгенерировать криптографически стойкие случайные байты\n");
+        fprintf(stderr, "Error: Failed to generate cryptographically secure random bytes\n");
         return -1;
     }
     

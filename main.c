@@ -1,6 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <locale.h>
+#include <stdarg.h>
+#include <time.h>
+#include <openssl/aes.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include "include/ecb.h"
@@ -8,9 +12,11 @@
 #include "include/file_io.h"
 #include "include/mouse_entropy.h"
 #include "include/csprng.h"
+#include "include/hash.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #include <io.h>
 #include <direct.h>
 #define stat _stat
@@ -20,6 +26,7 @@
 #else
 #include <sys/stat.h>
 #include <dirent.h>
+#include <sys/resource.h>
 #endif
 
 typedef struct {
@@ -27,6 +34,7 @@ typedef struct {
     char* mode;
     int encrypt;
     int decrypt;
+    int dgst;              // Hash mode flag
     char* key_hex;
     int use_mouse_key;
     char* iv_hex;
@@ -46,36 +54,563 @@ int decrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
 int encrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex);
 int decrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex);
 
+static void print_progress_bar(int current, int total) {
+    if (total <= 0) return;
+    const int bar_width = 30;
+    double ratio = (double)current / (double)total;
+    int pos = (int)(ratio * bar_width);
+    printf("[");
+    for (int i = 0; i < bar_width; i++) {
+        if (i < pos) putchar('#');
+        else if (i == pos) putchar('>');
+        else putchar('.');
+    }
+    printf("] %d/%d\r", current, total);
+    fflush(stdout);
+}
+
+static double get_memory_used_mb(void) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return (double)pmc.WorkingSetSize / (1024.0 * 1024.0);
+    }
+    return 0.0;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return (double)ru.ru_maxrss / 1024.0; // KB -> MB on Linux usually in KB
+    }
+    return 0.0;
+#endif
+}
+
+static void current_timestamp(char* buf, size_t sz) {
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+    strftime(buf, sz, "%Y-%m-%d %H:%M:%S", t);
+}
+
+/* Forward declarations for logging helpers */
+static void log_info(const char* fmt, ...);
+static void log_error(const char* fmt, ...);
+
+/* 64-bit file size helper */
+static unsigned long long get_file_size64_path(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0ULL;
+    
+#if defined(_WIN32) && defined(__USE_MINGW_ANSI_STDIO)
+    // MinGW/MSYS2: use _fseeki64 and _ftelli64
+    if (_fseeki64(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0ULL;
+    }
+    long long size = _ftelli64(f);
+#elif defined(_WIN32)
+    // Native Windows
+    if (_fseeki64(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0ULL;
+    }
+    long long size = _ftelli64(f);
+#else
+    // POSIX: use fseeko and ftello
+    if (fseeko(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0ULL;
+    }
+    off_t size = ftello(f);
+#endif
+    
+    fclose(f);
+    if (size < 0) return 0ULL;
+    return (unsigned long long)size;
+}
+
+/* Helpers for CTR streaming */
+static int calc_percent(unsigned long long processed, unsigned long long total) {
+    if (total == 0ULL) return 0;
+    double p = ((double)processed * 100.0) / (double)total;
+    if (p < 0.0) p = 0.0;
+    if (p > 100.0) p = 100.0;
+    return (int)(p + 0.5);
+}
+static void increment_counter_be(unsigned char* counter, unsigned long long blocks) {
+    for (int i = 0; i < 16; i++) {
+        unsigned int idx = 15 - i;
+        unsigned int add = (unsigned int)(blocks & 0xFF);
+        unsigned int sum = counter[idx] + add;
+        counter[idx] = (unsigned char)(sum & 0xFF);
+        blocks >>= 8;
+        if ((sum >> 8) == 0 && blocks == 0) break;
+    }
+}
+
+static int stream_encrypt_ctr_file(const char* in_path, const char* out_path, unsigned char* key, unsigned char* iv, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; // 4 MB
+    FILE* in = fopen(in_path, "rb");
+    if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb");
+    if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    if (fwrite(iv, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write IV to '%s'", out_path); fclose(in); fclose(out); return 1; }
+
+    unsigned char* in_buf = (unsigned char*)malloc(CHUNK);
+    unsigned char* out_buf = (unsigned char*)malloc(CHUNK);
+    if (!in_buf || !out_buf) { log_error("Error: failed to allocate buffers"); if (in_buf) free(in_buf); if (out_buf) free(out_buf); fclose(in); fclose(out); return 1; }
+
+    unsigned long long processed = 0ULL;
+    unsigned long long total = get_file_size64_path(in_path);
+    if (total == 0ULL) { log_error("Error: empty or unreadable file '%s'", in_path); free(in_buf); free(out_buf); fclose(in); fclose(out); return 1; }
+    while (1) {
+        size_t n = fread(in_buf, 1, CHUNK, in);
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(in_buf); free(out_buf); fclose(in); fclose(out); return 1; } break; }
+        size_t out_size = 0;
+        unsigned char iv_local[AES_BLOCK_SIZE];
+        memcpy(iv_local, iv, AES_BLOCK_SIZE);
+        unsigned char* enc = aes_ctr_encrypt(in_buf, n, key, iv_local, &out_size);
+        if (!enc || out_size != n) { log_error("Error: CTR chunk encrypt failed"); free(in_buf); free(out_buf); fclose(in); fclose(out); if (enc) free(enc); return 1; }
+        if (fwrite(enc, 1, out_size, out) != out_size) { log_error("Error: failed to write output chunk"); free(in_buf); free(out_buf); fclose(in); fclose(out); free(enc); return 1; }
+        free(enc);
+        unsigned long long blocks = (n + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE;
+        increment_counter_be(iv, blocks);
+        processed += (unsigned long long)n;
+        int percent = calc_percent(processed, total);
+        printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); fflush(stdout);
+    }
+    printf("\n");
+    if (processed == 0ULL) { log_error("Error: no data was processed"); free(in_buf); free(out_buf); fclose(in); fclose(out); return 1; }
+    if (out_total) *out_total = (size_t)(processed + AES_BLOCK_SIZE);
+    free(in_buf); free(out_buf); fclose(in); fclose(out); return 0;
+}
+
+static int stream_decrypt_ctr_file(const char* in_path, const char* out_path, unsigned char* key, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; // 4 MB
+    FILE* in = fopen(in_path, "rb");
+    if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb");
+    if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    unsigned char iv[AES_BLOCK_SIZE];
+    if (fread(iv, 1, AES_BLOCK_SIZE, in) != AES_BLOCK_SIZE) { log_error("Error: input too small to contain IV"); fclose(in); fclose(out); return 1; }
+
+    unsigned char* in_buf = (unsigned char*)malloc(CHUNK);
+    if (!in_buf) { log_error("Error: failed to allocate buffer"); fclose(in); fclose(out); return 1; }
+    unsigned long long processed = 0ULL;
+    unsigned long long total = get_file_size64_path(in_path);
+    if (total < AES_BLOCK_SIZE) { log_error("Error: file too small (no IV)"); free(in_buf); fclose(in); fclose(out); return 1; }
+    total -= AES_BLOCK_SIZE;
+    fseek(in, AES_BLOCK_SIZE, SEEK_SET);
+    while (1) {
+        size_t n = fread(in_buf, 1, CHUNK, in);
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(in_buf); fclose(in); fclose(out); return 1; } break; }
+        size_t out_size = 0;
+        unsigned char iv_local[AES_BLOCK_SIZE]; memcpy(iv_local, iv, AES_BLOCK_SIZE);
+        unsigned char* dec = aes_ctr_decrypt(in_buf, n, key, iv_local, &out_size);
+        if (!dec || out_size != n) { log_error("Error: CTR chunk decrypt failed"); free(in_buf); fclose(in); fclose(out); if (dec) free(dec); return 1; }
+        if (fwrite(dec, 1, out_size, out) != out_size) { log_error("Error: failed to write output chunk"); free(in_buf); fclose(in); fclose(out); free(dec); return 1; }
+        free(dec);
+        unsigned long long blocks = (n + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE;
+        increment_counter_be(iv, blocks);
+        processed += (unsigned long long)n;
+        int percent = calc_percent(processed, total);
+        printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); fflush(stdout);
+    }
+    printf("\n");
+    if (processed == 0ULL && total > 0ULL) { log_error("Error: no data was processed"); free(in_buf); fclose(in); fclose(out); return 1; }
+    if (out_total) *out_total = (size_t)processed;
+    free(in_buf); fclose(in); fclose(out); return 0;
+}
+
+/* Streaming for ECB (PKCS#7) */
+static int stream_encrypt_ecb_file(const char* in_path, const char* out_path, const unsigned char* key, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; // 4 MB
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    AES_KEY aes_key; if (AES_set_encrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_encrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK + AES_BLOCK_SIZE);
+    unsigned char out_block[AES_BLOCK_SIZE];
+    size_t carry_len = 0; unsigned char carry[AES_BLOCK_SIZE];
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path);
+    if (total == 0ULL) { log_error("Error: empty or unreadable file '%s'", in_path); free(buf); fclose(in); fclose(out); return 1; }
+    while (1) {
+        size_t n = fread(buf, 1, CHUNK, in);
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t offset = 0;
+        if (carry_len > 0) {
+            size_t need = AES_BLOCK_SIZE - carry_len;
+            size_t to_copy = (n < need) ? n : need;
+            memcpy(carry + carry_len, buf, to_copy);
+            carry_len += to_copy; offset += to_copy;
+            if (carry_len == AES_BLOCK_SIZE) {
+                AES_encrypt(carry, out_block, &aes_key);
+                if (fwrite(out_block, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write output block"); fclose(in); fclose(out); free(buf); return 1; }
+                carry_len = 0;
+            }
+        }
+        while (offset + AES_BLOCK_SIZE <= n) {
+            AES_encrypt(buf + offset, out_block, &aes_key);
+            if (fwrite(out_block, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write output block"); fclose(in); fclose(out); free(buf); return 1; }
+            offset += AES_BLOCK_SIZE;
+        }
+        if (offset < n) { carry_len = n - offset; memcpy(carry, buf + offset, carry_len); }
+        processed += (unsigned long long)n;
+        int percent = calc_percent(processed, total); printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); fflush(stdout);
+    }
+    printf("\n");
+    if (processed == 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    // finalize padding
+    unsigned char pad = (unsigned char)(AES_BLOCK_SIZE - carry_len);
+    for (size_t i = carry_len; i < AES_BLOCK_SIZE; i++) carry[i] = pad;
+    AES_encrypt(carry, out_block, &aes_key);
+    fwrite(out_block, 1, AES_BLOCK_SIZE, out);
+    if (out_total) { /* processed bytes rounded up to block + one pad block */ *out_total = (size_t)(((processed / AES_BLOCK_SIZE) * AES_BLOCK_SIZE) + AES_BLOCK_SIZE); }
+    free(buf); fclose(in); fclose(out); return 0;
+}
+
+static int stream_decrypt_ecb_file(const char* in_path, const char* out_path, const unsigned char* key, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; // 4 MB
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    AES_KEY aes_key; if (AES_set_decrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_decrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK);
+    unsigned char block[AES_BLOCK_SIZE], prev_block[AES_BLOCK_SIZE]; int have_prev = 0;
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path);
+    if (total == 0ULL) { log_error("Error: empty or unreadable file '%s'", in_path); free(buf); fclose(in); fclose(out); return 1; }
+    while (1) {
+        size_t n = fread(buf, 1, CHUNK, in);
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t offset = 0;
+        // ensure n is multiple of block for all but possibly last chunk; keep one block in prev
+        while (offset + AES_BLOCK_SIZE <= n) {
+            memcpy(block, buf + offset, AES_BLOCK_SIZE);
+            offset += AES_BLOCK_SIZE;
+            if (have_prev) {
+                unsigned char plain[AES_BLOCK_SIZE];
+                AES_decrypt(prev_block, plain, &aes_key);
+                if (fwrite(plain, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write output block"); free(buf); fclose(in); fclose(out); return 1; }
+            }
+            memcpy(prev_block, block, AES_BLOCK_SIZE); have_prev = 1;
+        }
+        processed += n;
+        int percent = calc_percent(processed, total); printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); fflush(stdout);
+    }
+    printf("\n");
+    if (processed == 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    if (!have_prev) { log_error("Error: input too small"); free(buf); fclose(in); fclose(out); return 1; }
+    // finalize: decrypt last block and remove padding
+    unsigned char last_plain[AES_BLOCK_SIZE];
+    AES_decrypt(prev_block, last_plain, &aes_key);
+    unsigned char pad = last_plain[AES_BLOCK_SIZE - 1];
+    if (pad == 0 || pad > AES_BLOCK_SIZE) { log_error("Error: invalid padding"); free(buf); fclose(in); fclose(out); return 1; }
+    for (int i = 0; i < pad; i++) if (last_plain[AES_BLOCK_SIZE - 1 - i] != pad) { log_error("Error: invalid padding"); free(buf); fclose(in); fclose(out); return 1; }
+    if (fwrite(last_plain, 1, AES_BLOCK_SIZE - pad, out) != AES_BLOCK_SIZE - pad) { log_error("Error: failed to write last block"); free(buf); fclose(in); fclose(out); return 1; }
+    if (out_total) { long out_size = ftell(out); if (out_size < 0) out_size = 0; *out_total = (size_t)out_size; }
+    free(buf); fclose(in); fclose(out); return 0;
+}
+
+/* Streaming for CBC (PKCS#7, with IV header) */
+static int stream_encrypt_cbc_file(const char* in_path, const char* out_path, const unsigned char* key, unsigned char* iv_in, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024;
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    AES_KEY aes_key; if (AES_set_encrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_encrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char iv[AES_BLOCK_SIZE]; memcpy(iv, iv_in, AES_BLOCK_SIZE);
+    if (fwrite(iv, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write IV"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK + AES_BLOCK_SIZE);
+    unsigned char carry[AES_BLOCK_SIZE]; size_t carry_len = 0;
+    unsigned char block[AES_BLOCK_SIZE], cipher[AES_BLOCK_SIZE];
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path);
+    if (total == 0ULL) { log_error("Error: empty or unreadable file '%s'", in_path); free(buf); fclose(in); fclose(out); return 1; }
+    while (1) {
+        size_t n = fread(buf, 1, CHUNK, in);
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t offset = 0;
+        if (carry_len > 0) {
+            size_t need = AES_BLOCK_SIZE - carry_len; size_t to_copy = (n < need) ? n : need;
+            memcpy(carry + carry_len, buf, to_copy); carry_len += to_copy; offset += to_copy;
+            if (carry_len == AES_BLOCK_SIZE) {
+                xor_blocks(block, carry, iv, AES_BLOCK_SIZE); AES_encrypt(block, cipher, &aes_key); if (fwrite(cipher, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } memcpy(iv, cipher, AES_BLOCK_SIZE); carry_len = 0;
+            }
+        }
+        while (offset + AES_BLOCK_SIZE <= n) {
+            xor_blocks(block, buf + offset, iv, AES_BLOCK_SIZE); AES_encrypt(block, cipher, &aes_key); if (fwrite(cipher, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } memcpy(iv, cipher, AES_BLOCK_SIZE); offset += AES_BLOCK_SIZE;
+        }
+        if (offset < n) { carry_len = n - offset; memcpy(carry, buf + offset, carry_len); }
+        processed += (unsigned long long)n; int percent = calc_percent(processed, total); printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); fflush(stdout);
+    }
+    printf("\n");
+    if (processed == 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    // finalize pad
+    unsigned char pad = (unsigned char)(AES_BLOCK_SIZE - carry_len);
+    for (size_t i = carry_len; i < AES_BLOCK_SIZE; i++) carry[i] = pad;
+    xor_blocks(block, carry, iv, AES_BLOCK_SIZE); AES_encrypt(block, cipher, &aes_key); fwrite(cipher, 1, AES_BLOCK_SIZE, out);
+    if (out_total) *out_total = (size_t)(processed + AES_BLOCK_SIZE * 2); // IV + data + padding block
+    free(buf); fclose(in); fclose(out); return 0;
+}
+
+static int stream_decrypt_cbc_file(const char* in_path, const char* out_path, const unsigned char* key, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024;
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    unsigned char iv[AES_BLOCK_SIZE]; if (fread(iv, 1, AES_BLOCK_SIZE, in) != AES_BLOCK_SIZE) { log_error("Error: input too small for IV"); fclose(in); fclose(out); return 1; }
+    AES_KEY aes_key; if (AES_set_decrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_decrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK);
+    unsigned char prev_cipher[AES_BLOCK_SIZE]; int have_prev = 0;
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path); 
+    if (total < AES_BLOCK_SIZE) { log_error("Error: file too small (no IV)"); free(buf); fclose(in); fclose(out); return 1; }
+    total -= AES_BLOCK_SIZE; fseek(in, AES_BLOCK_SIZE, SEEK_SET);
+    while (1) {
+        size_t n = fread(buf, 1, CHUNK, in);
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t offset = 0;
+        while (offset + AES_BLOCK_SIZE <= n) {
+            unsigned char cur_ciph[AES_BLOCK_SIZE]; memcpy(cur_ciph, buf + offset, AES_BLOCK_SIZE); offset += AES_BLOCK_SIZE;
+            if (have_prev) {
+                unsigned char temp[AES_BLOCK_SIZE], plain[AES_BLOCK_SIZE]; AES_decrypt(prev_cipher, temp, &aes_key); xor_blocks(plain, temp, iv, AES_BLOCK_SIZE); if (fwrite(plain, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } memcpy(iv, prev_cipher, AES_BLOCK_SIZE);
+            }
+            memcpy(prev_cipher, cur_ciph, AES_BLOCK_SIZE); have_prev = 1;
+        }
+        processed += (unsigned long long)n; int percent = calc_percent(processed, total); printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); fflush(stdout);
+    }
+    printf("\n");
+    if (processed == 0ULL && total > 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    if (!have_prev) { log_error("Error: no ciphertext blocks"); free(buf); fclose(in); fclose(out); return 1; }
+    unsigned char temp[AES_BLOCK_SIZE], last_plain[AES_BLOCK_SIZE]; AES_decrypt(prev_cipher, temp, &aes_key); xor_blocks(last_plain, temp, iv, AES_BLOCK_SIZE);
+    unsigned char pad = last_plain[AES_BLOCK_SIZE - 1]; if (pad == 0 || pad > AES_BLOCK_SIZE) { log_error("Error: invalid padding"); free(buf); fclose(in); fclose(out); return 1; }
+    for (int i = 0; i < pad; i++) if (last_plain[AES_BLOCK_SIZE - 1 - i] != pad) { log_error("Error: invalid padding"); free(buf); fclose(in); fclose(out); return 1; }
+    if (fwrite(last_plain, 1, AES_BLOCK_SIZE - pad, out) != AES_BLOCK_SIZE - pad) { log_error("Error: write last"); free(buf); fclose(in); fclose(out); return 1; }
+    if (out_total) *out_total = (size_t)processed; // approximation
+    free(buf); fclose(in); fclose(out); return 0;
+}
+
+/* Streaming for CFB (full-block segment) */
+static int stream_encrypt_cfb_file(const char* in_path, const char* out_path, const unsigned char* key, const unsigned char* iv_in, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; 
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    if (fwrite(iv_in, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write IV"); fclose(in); fclose(out); return 1; }
+    AES_KEY aes_key; if (AES_set_encrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_encrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK);
+    unsigned char sr[AES_BLOCK_SIZE]; memcpy(sr, iv_in, AES_BLOCK_SIZE);
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path);
+    if (total == 0ULL) { log_error("Error: empty or unreadable file '%s'", in_path); free(buf); fclose(in); fclose(out); return 1; }
+    while (1) { 
+        size_t n = fread(buf, 1, CHUNK, in); 
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t i = 0; 
+        while (i + AES_BLOCK_SIZE <= n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(sr, ks, &aes_key); 
+            unsigned char ct[AES_BLOCK_SIZE]; xor_blocks(ct, buf + i, ks, AES_BLOCK_SIZE); 
+            if (fwrite(ct, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(sr, ct, AES_BLOCK_SIZE); i += AES_BLOCK_SIZE; 
+        } 
+        if (i < n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(sr, ks, &aes_key); 
+            size_t rem = n - i; unsigned char ct[AES_BLOCK_SIZE]; 
+            xor_blocks(ct, buf + i, ks, rem); 
+            if (fwrite(ct, 1, rem, out) != rem) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(sr, ct, rem); 
+        } 
+        processed += (unsigned long long)n; 
+        int percent = calc_percent(processed, total); 
+        printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); 
+        fflush(stdout);
+    } 
+    printf("\n"); 
+    if (processed == 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    if (out_total) { *out_total = (size_t)(processed + AES_BLOCK_SIZE); } 
+    free(buf); fclose(in); fclose(out); return 0; 
+}
+
+static int stream_decrypt_cfb_file(const char* in_path, const char* out_path, const unsigned char* key, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; 
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    unsigned char sr[AES_BLOCK_SIZE]; if (fread(sr, 1, AES_BLOCK_SIZE, in) != AES_BLOCK_SIZE) { log_error("Error: input too small for IV"); fclose(in); fclose(out); return 1; }
+    AES_KEY aes_key; if (AES_set_encrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_encrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK);
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path); 
+    if (total < AES_BLOCK_SIZE) { log_error("Error: file too small (no IV)"); free(buf); fclose(in); fclose(out); return 1; }
+    total -= AES_BLOCK_SIZE; fseek(in, AES_BLOCK_SIZE, SEEK_SET);
+    while (1) { 
+        size_t n = fread(buf, 1, CHUNK, in); 
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t i = 0; 
+        while (i + AES_BLOCK_SIZE <= n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(sr, ks, &aes_key); 
+            unsigned char pt[AES_BLOCK_SIZE]; xor_blocks(pt, buf + i, ks, AES_BLOCK_SIZE); 
+            if (fwrite(pt, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(sr, buf + i, AES_BLOCK_SIZE); i += AES_BLOCK_SIZE; 
+        } 
+        if (i < n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(sr, ks, &aes_key); 
+            size_t rem = n - i; unsigned char pt[AES_BLOCK_SIZE]; 
+            xor_blocks(pt, buf + i, ks, rem); 
+            if (fwrite(pt, 1, rem, out) != rem) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(sr, buf + i, rem); 
+        } 
+        processed += (unsigned long long)n; 
+        int percent = calc_percent(processed, total); 
+        printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); 
+        fflush(stdout);
+    } 
+    printf("\n"); 
+    if (processed == 0ULL && total > 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    if (out_total) { *out_total = (size_t)processed; } 
+    free(buf); fclose(in); fclose(out); return 0; 
+}
+
+/* Streaming for OFB */
+static int stream_encrypt_ofb_file(const char* in_path, const char* out_path, const unsigned char* key, const unsigned char* iv_in, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; 
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    if (fwrite(iv_in, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: failed to write IV"); fclose(in); fclose(out); return 1; }
+    AES_KEY aes_key; if (AES_set_encrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_encrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK);
+    unsigned char feedback[AES_BLOCK_SIZE]; memcpy(feedback, iv_in, AES_BLOCK_SIZE);
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path);
+    if (total == 0ULL) { log_error("Error: empty or unreadable file '%s'", in_path); free(buf); fclose(in); fclose(out); return 1; }
+    while (1) { 
+        size_t n = fread(buf, 1, CHUNK, in); 
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t i = 0; 
+        while (i + AES_BLOCK_SIZE <= n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(feedback, ks, &aes_key); 
+            unsigned char ct[AES_BLOCK_SIZE]; xor_blocks(ct, buf + i, ks, AES_BLOCK_SIZE); 
+            if (fwrite(ct, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(feedback, ks, AES_BLOCK_SIZE); i += AES_BLOCK_SIZE; 
+        } 
+        if (i < n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(feedback, ks, &aes_key); 
+            size_t rem = n - i; unsigned char ct[AES_BLOCK_SIZE]; 
+            xor_blocks(ct, buf + i, ks, rem); 
+            if (fwrite(ct, 1, rem, out) != rem) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(feedback, ks, AES_BLOCK_SIZE); 
+        } 
+        processed += (unsigned long long)n; 
+        int percent = calc_percent(processed, total); 
+        printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); 
+        fflush(stdout);
+    } 
+    printf("\n"); 
+    if (processed == 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    if (out_total) { *out_total = (size_t)(processed + AES_BLOCK_SIZE); } 
+    free(buf); fclose(in); fclose(out); return 0; 
+}
+
+static int stream_decrypt_ofb_file(const char* in_path, const char* out_path, const unsigned char* key, size_t* out_total) {
+    const size_t CHUNK = 4 * 1024 * 1024; 
+    FILE* in = fopen(in_path, "rb"); if (!in) { log_error("Error: failed to open input file '%s'", in_path); return 1; }
+    FILE* out = fopen(out_path, "wb"); if (!out) { log_error("Error: failed to open output file '%s'", out_path); fclose(in); return 1; }
+    unsigned char feedback[AES_BLOCK_SIZE]; if (fread(feedback, 1, AES_BLOCK_SIZE, in) != AES_BLOCK_SIZE) { log_error("Error: input too small for IV"); fclose(in); fclose(out); return 1; }
+    AES_KEY aes_key; if (AES_set_encrypt_key(key, 128, &aes_key) < 0) { log_error("Error: AES_set_encrypt_key failed"); fclose(in); fclose(out); return 1; }
+    unsigned char* buf = (unsigned char*)malloc(CHUNK);
+    unsigned long long processed = 0ULL; unsigned long long total = get_file_size64_path(in_path); 
+    if (total < AES_BLOCK_SIZE) { log_error("Error: file too small (no IV)"); free(buf); fclose(in); fclose(out); return 1; }
+    total -= AES_BLOCK_SIZE; fseek(in, AES_BLOCK_SIZE, SEEK_SET);
+    while (1) { 
+        size_t n = fread(buf, 1, CHUNK, in); 
+        if (n == 0) { if (ferror(in)) { log_error("Error reading input file"); free(buf); fclose(in); fclose(out); return 1; } break; }
+        size_t i = 0; 
+        while (i + AES_BLOCK_SIZE <= n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(feedback, ks, &aes_key); 
+            unsigned char pt[AES_BLOCK_SIZE]; xor_blocks(pt, buf + i, ks, AES_BLOCK_SIZE); 
+            if (fwrite(pt, 1, AES_BLOCK_SIZE, out) != AES_BLOCK_SIZE) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(feedback, ks, AES_BLOCK_SIZE); i += AES_BLOCK_SIZE; 
+        } 
+        if (i < n) { 
+            unsigned char ks[AES_BLOCK_SIZE]; AES_encrypt(feedback, ks, &aes_key); 
+            size_t rem = n - i; unsigned char pt[AES_BLOCK_SIZE]; 
+            xor_blocks(pt, buf + i, ks, rem); 
+            if (fwrite(pt, 1, rem, out) != rem) { log_error("Error: write"); free(buf); fclose(in); fclose(out); return 1; } 
+            memcpy(feedback, ks, AES_BLOCK_SIZE); 
+        } 
+        processed += (unsigned long long)n; 
+        int percent = calc_percent(processed, total); 
+        printf("\rProgress: %3d%%, Processed: %llu / %llu bytes", percent, processed, total); 
+        fflush(stdout);
+    } 
+    printf("\n"); 
+    if (processed == 0ULL && total > 0ULL) { log_error("Error: no data was processed"); free(buf); fclose(in); fclose(out); return 1; }
+    if (out_total) { *out_total = (size_t)processed; } 
+    free(buf); fclose(in); fclose(out); return 0; 
+}
+
+static void log_info(const char* fmt, ...) {
+    char ts[32];
+    current_timestamp(ts, sizeof(ts));
+    double mem = get_memory_used_mb();
+    printf("[%s] [Memory: %.2f MB] ", ts, mem);
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
+
+static void log_error(const char* fmt, ...) {
+    char ts[32];
+    current_timestamp(ts, sizeof(ts));
+    double mem = get_memory_used_mb();
+    fprintf(stderr, "[%s] [Memory: %.2f MB] ", ts, mem);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n");
+}
+
 /**
  * Вывод информации об использовании программы
  */
 void print_usage(const char* program_name) {
-    fprintf(stderr, "Использование: %s [ОПЦИИ]\n\n", program_name);
-    fprintf(stderr, "Обязательные опции:\n");
-    fprintf(stderr, "  --algorithm АЛГОРИТМ   Алгоритм шифрования (поддерживается: aes)\n");
-    fprintf(stderr, "  --mode РЕЖИМ           Режим работы (ecb, cbc, cfb, ofb, ctr)\n");
-    fprintf(stderr, "  --encrypt              Выполнить шифрование\n");
-    fprintf(stderr, "  --decrypt              Выполнить дешифрование\n");
-    fprintf(stderr, "  --key КЛЮЧ             Ключ шифрования/дешифрования (hex-строка, 32 символа для AES-128)\n");
-    fprintf(stderr, "  --input ФАЙЛ           Путь к входному файлу\n");
+    fprintf(stderr, "Usage: %s [COMMAND] [OPTIONS]\n\n", program_name);
+    
+    fprintf(stderr, "COMMANDS:\n");
+    fprintf(stderr, "  (default)              Encryption/decryption mode\n");
+    fprintf(stderr, "  dgst                   Hash computation mode\n\n");
+    
+    fprintf(stderr, "=== ENCRYPTION/DECRYPTION MODE ===\n");
+    fprintf(stderr, "Required options:\n");
+    fprintf(stderr, "  --algorithm ALG        Encryption algorithm (supported: aes)\n");
+    fprintf(stderr, "  --mode MODE            Mode (ecb, cbc, cfb, ofb, ctr)\n");
+    fprintf(stderr, "  --encrypt              Perform encryption\n");
+    fprintf(stderr, "  --decrypt              Perform decryption\n");
+    fprintf(stderr, "  --key KEY              Encryption/Decryption key (hex string, 32 chars for AES-128)\n");
+    fprintf(stderr, "  --input FILE           Path to input file or directory\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Опциональные:\n");
-    fprintf(stderr, "  --output ФАЙЛ          Путь к выходному файлу (по умолчанию: <input>.enc или <input>.dec)\n");
-    fprintf(stderr, "  --iv IV                Вектор инициализации (только для дешифрования, hex-строка, 32 символа)\n");
+    fprintf(stderr, "Optional:\n");
+    fprintf(stderr, "  --output FILE          Path to output file or directory (default: <input>.enc or <input>.dec)\n");
+    fprintf(stderr, "  --iv IV                Initialization Vector (decrypt only, hex string, 32 chars)\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Примечания:\n");
-    fprintf(stderr, "  - При шифровании автоматически генерируется ключ по движению мыши\n");
-    fprintf(stderr, "  - При шифровании директории программа запросит новые имена для каждого файла\n");
-    fprintf(stderr, "  - Для режимов ecb: IV не используется\n");
-    fprintf(stderr, "  - Для режимов cbc, cfb, ofb, ctr:\n");
-    fprintf(stderr, "    * При шифровании: IV генерируется автоматически и добавляется в начало файла\n");
-    fprintf(stderr, "    * При дешифровании: IV читается из начала файла или указывается через --iv\n");
+    fprintf(stderr, "Notes:\n");
+    fprintf(stderr, "  - On encryption a key can be generated automatically (mouse/CSPRNG)\n");
+    fprintf(stderr, "  - On directory encryption the program will prompt for new names for each file\n");
+    fprintf(stderr, "  - For ecb: IV is not used\n");
+    fprintf(stderr, "  - For cbc, cfb, ofb, ctr:\n");
+    fprintf(stderr, "    * Encryption: IV is generated automatically and prepended to the file\n");
+    fprintf(stderr, "    * Decryption: IV is read from the beginning of the file or provided via --iv\n");
     fprintf(stderr, "\n");
-    fprintf(stderr, "Примеры:\n");
-    fprintf(stderr, "  Шифрование директории:\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  Encrypt directory:\n");
     fprintf(stderr, "    %s --algorithm aes --mode cbc --encrypt --input ./files --output ./encryptfiles\n\n", program_name);
-    fprintf(stderr, "  Дешифрование директории:\n");
-    fprintf(stderr, "    %s --algorithm aes --mode cbc --decrypt --input ./encryptfiles --output ./decryptfiles\n", program_name);
+    fprintf(stderr, "  Decrypt directory:\n");
+    fprintf(stderr, "    %s --algorithm aes --mode cbc --decrypt --input ./encryptfiles --output ./decryptfiles\n\n", program_name);
+    
+    fprintf(stderr, "=== HASH MODE (dgst command) ===\n");
+    fprintf(stderr, "Required options:\n");
+    fprintf(stderr, "  --algorithm ALG        Hash algorithm (sha256, sha3-256)\n");
+    fprintf(stderr, "  --input FILE           Path to input file\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Optional:\n");
+    fprintf(stderr, "  --output FILE          Write hash to file instead of stdout\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  Compute SHA-256 hash:\n");
+    fprintf(stderr, "    %s dgst --algorithm sha256 --input document.pdf\n\n", program_name);
+    fprintf(stderr, "  Compute SHA3-256 hash and save to file:\n");
+    fprintf(stderr, "    %s dgst --algorithm sha3-256 --input backup.tar --output backup.sha3\n", program_name);
 }
 
 /**
@@ -85,17 +620,27 @@ int parse_args(int argc, char* argv[], cli_args_t* args) {
     // Инициализация аргументов
     memset(args, 0, sizeof(cli_args_t));
 
+    // Check for dgst command
+    if (argc > 1 && strcmp(argv[1], "dgst") == 0) {
+        args->dgst = 1;
+        // Skip "dgst" argument
+        for (int i = 2; i < argc; i++) {
+            argv[i-1] = argv[i];
+        }
+        argc--;
+    }
+
     // Разбор аргументов
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--algorithm") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Ошибка: --algorithm требует аргумент\n");
+                fprintf(stderr, "Error: --algorithm requires an argument\n");
                 return -1;
             }
             args->algorithm = argv[++i];
         } else if (strcmp(argv[i], "--mode") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Ошибка: --mode требует аргумент\n");
+                fprintf(stderr, "Error: --mode requires an argument\n");
                 return -1;
             }
             args->mode = argv[++i];
@@ -105,19 +650,19 @@ int parse_args(int argc, char* argv[], cli_args_t* args) {
             args->decrypt = 1;
         } else if (strcmp(argv[i], "--key") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Ошибка: --key требует аргумент\n");
+                fprintf(stderr, "Error: --key requires an argument\n");
                 return -1;
             }
             args->key_hex = argv[++i];
         } else if (strcmp(argv[i], "--iv") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Ошибка: --iv требует аргумент\n");
+                fprintf(stderr, "Error: --iv requires an argument\n");
                 return -1;
             }
             args->iv_hex = argv[++i];
         } else if (strcmp(argv[i], "--input") == 0) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "Ошибка: --input требует аргумент\n");
+                fprintf(stderr, "Error: --input requires an argument\n");
                 return -1;
             }
             args->input_path = argv[++i];
@@ -128,7 +673,7 @@ int parse_args(int argc, char* argv[], cli_args_t* args) {
             }
             args->output_path = argv[++i];
         } else {
-            fprintf(stderr, "Ошибка: Неизвестный аргумент '%s'\n", argv[i]);
+            fprintf(stderr, "Error: Unknown argument '%s'\n", argv[i]);
             return -1;
         }
     }
@@ -152,11 +697,11 @@ int mode_requires_iv(const char* mode) {
 int validate_args(cli_args_t* args) {
     // Проверка обязательных аргументов
     if (!args->algorithm) {
-        fprintf(stderr, "Ошибка: --algorithm обязателен\n");
+        fprintf(stderr, "Error: --algorithm is required\n");
         return -1;
     }
     if (!args->mode) {
-        fprintf(stderr, "Ошибка: --mode обязателен\n");
+        fprintf(stderr, "Error: --mode is required\n");
         return -1;
     }
     if (args->encrypt) {
@@ -165,11 +710,11 @@ int validate_args(cli_args_t* args) {
     
     // Sprint 3: --key теперь опциональный для шифрования
     if (!args->key_hex && !args->use_mouse_key && !args->encrypt) {
-        fprintf(stderr, "Ошибка: --key обязателен при дешифровании\n");
+        fprintf(stderr, "Error: --key is required for decryption\n");
         return -1;
     }
     if (!args->input_path) {
-        fprintf(stderr, "Ошибка: --input обязателен\n");
+        fprintf(stderr, "Error: --input is required\n");
         return -1;
     }
     
@@ -186,21 +731,21 @@ int validate_args(cli_args_t* args) {
 
     // Проверка флагов шифрования/дешифрования
     if (args->encrypt && args->decrypt) {
-        fprintf(stderr, "Ошибка: Нельзя указывать одновременно --encrypt и --decrypt\n");
+        fprintf(stderr, "Error: cannot use --encrypt and --decrypt together\n");
         return -1;
     }
     if (!args->encrypt && !args->decrypt) {
-        fprintf(stderr, "Ошибка: Необходимо указать --encrypt или --decrypt\n");
+        fprintf(stderr, "Error: one of --encrypt or --decrypt must be specified\n");
         return -1;
     }
 
     if (args->use_mouse_key) {
 #ifndef _WIN32
-        fprintf(stderr, "Ошибка: Генерация ключа по мыши доступна только в Windows-сборке\n");
+        fprintf(stderr, "Error: mouse-based key generation is available only on Windows build\n");
         return -1;
 #else
         if (args->key_hex) {
-            fprintf(stderr, "Предупреждение: --key игнорируется при автоматической генерации ключа\n");
+            fprintf(stderr, "Warning: --key is ignored when automatic key generation is enabled\n");
             args->key_hex = NULL;
         }
 #endif
@@ -211,7 +756,7 @@ int validate_args(cli_args_t* args) {
     
     if (needs_iv) {
         if (args->encrypt && args->iv_hex) {
-            fprintf(stderr, "Предупреждение: --iv игнорируется при шифровании (IV генерируется автоматически)\n");
+            fprintf(stderr, "Warning: --iv is ignored during encryption (IV is generated automatically)\n");
             args->iv_hex = NULL;
         }
         // При дешифровании IV может быть не указан - будет читаться из файла
@@ -219,7 +764,7 @@ int validate_args(cli_args_t* args) {
 
     // Проверка алгоритма
     if (strcmp(args->algorithm, "aes") != 0) {
-        fprintf(stderr, "Ошибка: Неподдерживаемый алгоритм '%s'. Поддерживается только 'aes'.\n", args->algorithm);
+        fprintf(stderr, "Error: unsupported algorithm '%s'. Only 'aes' is supported.\n", args->algorithm);
         return -1;
     }
 
@@ -227,7 +772,7 @@ int validate_args(cli_args_t* args) {
     if (strcmp(args->mode, "ecb") != 0 && strcmp(args->mode, "cbc") != 0 &&
         strcmp(args->mode, "cfb") != 0 && strcmp(args->mode, "ofb") != 0 &&
         strcmp(args->mode, "ctr") != 0) {
-        fprintf(stderr, "Ошибка: Неподдерживаемый режим '%s'. Поддерживаются: ecb, cbc, cfb, ofb, ctr.\n", args->mode);
+        fprintf(stderr, "Error: unsupported mode '%s'. Supported: ecb, cbc, cfb, ofb, ctr.\n", args->mode);
         return -1;
     }
 
@@ -235,8 +780,8 @@ int validate_args(cli_args_t* args) {
     if (args->key_hex) {
     size_t key_len = strlen(args->key_hex);
     if (key_len != 32) {
-        fprintf(stderr, "Ошибка: Ключ AES-128 должен быть 32 шестнадцатеричных символа (16 байт)\n");
-        fprintf(stderr, "       Предоставлена длина ключа: %zu символов\n", key_len);
+        fprintf(stderr, "Error: AES-128 key must be 32 hex chars (16 bytes)\n");
+        fprintf(stderr, "       Provided key length: %zu chars\n", key_len);
         return -1;
         }
     }
@@ -250,8 +795,8 @@ int validate_args(cli_args_t* args) {
             // Проверка длины IV
             size_t iv_len = strlen(args->iv_hex);
             if (iv_len != 32) {
-                fprintf(stderr, "Ошибка: IV должен быть 32 шестнадцатеричных символа (16 байт)\n");
-                fprintf(stderr, "       Предоставлена длина IV: %zu символов\n", iv_len);
+            fprintf(stderr, "Error: IV must be 32 hex chars (16 bytes)\n");
+            fprintf(stderr, "       Provided IV length: %zu chars\n", iv_len);
                 return -1;
             }
         }
@@ -350,7 +895,7 @@ void free_file_list(char** files, int file_count) {
  */
 char* get_new_filename(const char* original_name) {
     char* new_name = malloc(256);
-    printf("Введите имя нового файла для '%s': ", original_name);
+    printf("Enter new name for '%s': ", original_name);
     if (fgets(new_name, 256, stdin) == NULL) {
         free(new_name);
         return NULL;
@@ -466,7 +1011,68 @@ void free_metadata(filename_mapping_t* mappings, int count, char* key_hex) {
     }
 }
 
+/**
+ * Handle dgst command for computing file hashes
+ */
+int handle_dgst_command(cli_args_t* args) {
+    uint8_t hash[32];
+    char hex_hash[65];
+    
+    // Validate arguments
+    if (!args->algorithm) {
+        fprintf(stderr, "Error: --algorithm is required for dgst command\n");
+        return 1;
+    }
+    
+    if (!args->input_path) {
+        fprintf(stderr, "Error: --input is required for dgst command\n");
+        return 1;
+    }
+    
+    // Compute hash based on algorithm
+    int hash_result = -1;
+    if (strcmp(args->algorithm, "sha256") == 0) {
+        hash_result = sha256_hash_file(args->input_path, hash);
+    } else if (strcmp(args->algorithm, "sha3-256") == 0) {
+        hash_result = sha3_256_hash_file(args->input_path, hash);
+    } else {
+        fprintf(stderr, "Error: Unsupported hash algorithm '%s'\n", args->algorithm);
+        fprintf(stderr, "Supported: sha256, sha3-256\n");
+        return 1;
+    }
+    
+    // Check if hashing was successful
+    if (hash_result != 0) {
+        return 1;
+    }
+    
+    hash_to_hex(hash, 32, hex_hash);
+    
+    // Output hash
+    if (args->output_path) {
+        // Write to file
+        FILE* f = fopen(args->output_path, "w");
+        if (!f) {
+            fprintf(stderr, "Error: Failed to open output file '%s'\n", args->output_path);
+            return 1;
+        }
+        fprintf(f, "%s  %s\n", hex_hash, args->input_path);
+        fclose(f);
+    } else {
+        // Print to stdout
+        printf("%s  %s\n", hex_hash, args->input_path);
+    }
+
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
+    /* Устанавливаем локаль/кодировку консоли на UTF-8 */
+    setlocale(LC_ALL, "");
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+#endif
     cli_args_t args;
     unsigned char* key = NULL;
     char* key_hex = NULL;
@@ -484,6 +1090,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Handle dgst command separately
+    if (args.dgst) {
+        return handle_dgst_command(&args);
+    }
+
     if (validate_args(&args) != 0) {
         fprintf(stderr, "\n");
         print_usage(argv[0]);
@@ -495,24 +1106,25 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
         key = (unsigned char*)malloc(AES_128_KEY_SIZE);
         if (!key) {
-            fprintf(stderr, "Ошибка: Не удалось выделить память для ключа\n");
+            log_error("Error: failed to allocate memory for key");
             goto cleanup;
         }
-        printf("Генерация ключа по движению мыши...\n");
+    log_info("Starting crypto utility session...");
+    log_info("Generating encryption key (mouse entropy)...");
         if (generate_mouse_key(key, AES_128_KEY_SIZE) != 0) {
-            fprintf(stderr, "Ошибка: Не удалось сгенерировать ключ на основе движения мыши\n");
+            log_error("Error: failed to generate mouse-based key");
             goto cleanup;
         }
-        printf("Ключ успешно сгенерирован.\n");
+        log_info("Key generated successfully!");
         
         // Преобразуем ключ в hex для сохранения
         key_hex = malloc(AES_128_KEY_SIZE * 2 + 1);
         for (int i = 0; i < AES_128_KEY_SIZE; i++) {
             sprintf(key_hex + i * 2, "%02x", key[i]);
         }
-        printf("Ключ (hex): %s\n", key_hex);
+        printf("Key (hex): %s\n", key_hex);
 #else
-        fprintf(stderr, "Ошибка: Генерация ключа по мыши доступна только в Windows\n");
+        log_error("Error: mouse-based key generation is Windows-only");
         goto cleanup;
 #endif
     } else if (args.key_hex) {
@@ -526,24 +1138,24 @@ int main(int argc, char* argv[]) {
         goto cleanup;
     }
     if (key_size != AES_128_KEY_SIZE) {
-        fprintf(stderr, "Ошибка: Ключ должен быть ровно %d байт для AES-128\n", AES_128_KEY_SIZE);
+        log_error("Error: key must be exactly %d bytes for AES-128", AES_128_KEY_SIZE);
         goto cleanup;
     }
 
         // Проверка на слабые ключи
         if (is_weak_key(key, AES_128_KEY_SIZE)) {
-            fprintf(stderr, "Предупреждение: Обнаружен слабый ключ. Рекомендуется использовать криптографически стойкий ключ.\n");
+            log_error("Warning: weak key detected. Use a cryptographically strong key.");
         }
     } else if (args.encrypt) {
         // Sprint 3: Генерация случайного ключа при шифровании
         key = (unsigned char*)malloc(AES_128_KEY_SIZE);
         if (!key) {
-            fprintf(stderr, "Ошибка: Не удалось выделить память для ключа\n");
-            goto cleanup;
-        }
+            log_error("Error: failed to allocate memory for key");
+                goto cleanup;
+            }
         
         if (generate_aes_key(key) != 0) {
-            fprintf(stderr, "Ошибка: Не удалось сгенерировать криптографически стойкий ключ\n");
+            log_error("Error: failed to generate cryptographically secure key");
             goto cleanup;
         }
         
@@ -553,13 +1165,13 @@ int main(int argc, char* argv[]) {
             sprintf(key_hex + i * 2, "%02x", key[i]);
         }
         
-        // Выводим ключ согласно Sprint 3 требованиям
-        printf("[INFO] Generated random key: %s\n", key_hex);
-    } else {
-        // При дешифровании ключ обязателен
-        fprintf(stderr, "Ошибка: --key обязателен при дешифровании\n");
-        goto cleanup;
-    }
+        // Print generated key (Sprint 3 requirement)
+        log_info("Generated random key: %s", key_hex);
+        } else {
+        // For decryption key is required
+        log_error("Error: --key is required for decryption");
+                    goto cleanup;
+                }
 
     // Проверяем, является ли входной путь директорией
     if (is_directory(args.input_path)) {
@@ -596,12 +1208,84 @@ int encrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
     
     (void)key_hex;  // Не используется в функции одиночного файла
 
-    // Чтение входного файла
-    input_data = read_file(args->input_path, &input_size);
-    if (!input_data) {
+    // Потоковая обработка (4MB) для всех режимов
+    if (strcmp(args->mode, "ctr") == 0) {
+        int needs_iv_stream = 1;
+        unsigned char* iv_local = NULL;
+        if (needs_iv_stream) {
+            iv_local = malloc(AES_BLOCK_SIZE);
+            if (!iv_local) goto cleanup;
+            if (generate_random_iv(iv_local) != 0) { log_error("Error: failed to generate cryptographically secure IV"); goto cleanup; }
+        }
+        log_info("Encrypt '%s' -> '%s' (mode: ctr, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb();
+        clock_t t_start = clock();
+        size_t out_total = 0;
+        int sres = stream_encrypt_ctr_file(args->input_path, args->output_path, key, iv_local, &out_total);
+        clock_t t_end = clock();
+        double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+        double mem_after_mb = get_memory_used_mb();
+        if (iv_local) free(iv_local);
+        if (sres != 0) goto cleanup;
+        double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+        log_info("Success! Processed -> %zu bytes", out_total);
+        log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)",
+                 elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0;
         goto cleanup;
     }
+    if (strcmp(args->mode, "ecb") == 0) {
+        log_info("Encrypt '%s' -> '%s' (mode: ecb, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_encrypt_ecb_file(args->input_path, args->output_path, key, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+        log_info("Success! Processed -> %zu bytes", out_total);
+        log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+    if (strcmp(args->mode, "cbc") == 0) {
+        unsigned char iv_local[AES_BLOCK_SIZE]; if (generate_random_iv(iv_local) != 0) { log_error("Error: failed to generate cryptographically secure IV"); goto cleanup; }
+        log_info("Encrypt '%s' -> '%s' (mode: cbc, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_encrypt_cbc_file(args->input_path, args->output_path, key, iv_local, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+        log_info("Success! Processed -> %zu bytes", out_total);
+        log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+    if (strcmp(args->mode, "cfb") == 0) {
+        unsigned char iv_local[AES_BLOCK_SIZE]; if (generate_random_iv(iv_local) != 0) { log_error("Error: failed to generate cryptographically secure IV"); goto cleanup; }
+        log_info("Encrypt '%s' -> '%s' (mode: cfb, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_encrypt_cfb_file(args->input_path, args->output_path, key, iv_local, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+        log_info("Success! Processed -> %zu bytes", out_total);
+        log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+    if (strcmp(args->mode, "ofb") == 0) {
+        unsigned char iv_local[AES_BLOCK_SIZE]; if (generate_random_iv(iv_local) != 0) { log_error("Error: failed to generate cryptographically secure IV"); goto cleanup; }
+        log_info("Encrypt '%s' -> '%s' (mode: ofb, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_encrypt_ofb_file(args->input_path, args->output_path, key, iv_local, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+        log_info("Success! Processed -> %zu bytes", out_total);
+        log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
 
+    // Чтение входного файла
+    double mem_before_mb = get_memory_used_mb();
+    clock_t t_start = clock();
+    input_data = read_file(args->input_path, &input_size);
+    if (!input_data) {
+            goto cleanup;
+        }
+        
     // Sprint 3: Генерация IV с использованием CSPRNG
     if (needs_iv) {
         iv = malloc(AES_BLOCK_SIZE);
@@ -609,13 +1293,13 @@ int encrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
             goto cleanup;
         }
         if (generate_random_iv(iv) != 0) {
-            fprintf(stderr, "Ошибка: Не удалось сгенерировать криптографически стойкий IV\n");
+            fprintf(stderr, "Error: failed to generate cryptographically secure IV\n");
             goto cleanup;
         }
     }
 
     // Шифрование
-    printf("Шифрование '%s' -> '%s' (режим: %s)\n", args->input_path, args->output_path, args->mode);
+    log_info("Encrypt '%s' -> '%s' (mode: %s)", args->input_path, args->output_path, args->mode);
     
     if (strcmp(args->mode, "ecb") == 0) {
             output_data = aes_ecb_encrypt(input_data, input_size, key, &output_size);
@@ -653,7 +1337,13 @@ int encrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
         goto cleanup;
     }
 
-    printf("Успешно! Обработано %zu байт -> %zu байт\n", input_size, output_size);
+    clock_t t_end = clock();
+    double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+    double mem_after_mb = get_memory_used_mb();
+    double mbps = (elapsed_sec > 0.0) ? ((double)output_size / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+    log_info("Success! Processed %zu bytes -> %zu bytes", input_size, output_size);
+    log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (diff: %.2f MB)",
+             elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
     result = 0;
 
 cleanup:
@@ -689,13 +1379,13 @@ int decrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
             size_t iv_size;
             iv = hex_to_bytes(args->iv_hex, &iv_size);
             if (!iv || iv_size != AES_BLOCK_SIZE) {
-                fprintf(stderr, "Ошибка: Неверный IV\n");
+                fprintf(stderr, "Error: invalid IV\n");
                 goto cleanup;
             }
         } else {
             // IV читается из начала файла
             if (input_size < AES_BLOCK_SIZE) {
-                fprintf(stderr, "Ошибка: Файл слишком мал, чтобы содержать IV\n");
+                fprintf(stderr, "Error: file is too small to contain IV\n");
                 goto cleanup;
             }
             
@@ -717,8 +1407,69 @@ int decrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
         }
     }
 
+    // Потоковая обработка для всех режимов
+    if (strcmp(args->mode, "ctr") == 0) {
+    log_info("Decrypt '%s' -> '%s' (mode: ctr, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb();
+        clock_t t_start = clock();
+        size_t out_total = 0;
+        int sres = stream_decrypt_ctr_file(args->input_path, args->output_path, key, &out_total);
+        clock_t t_end = clock();
+        double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+        double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup;
+        double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+    log_info("Success! Processed -> %zu bytes", out_total);
+    log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)",
+                 elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0;
+        goto cleanup;
+    }
+    if (strcmp(args->mode, "ecb") == 0) {
+    log_info("Decrypt '%s' -> '%s' (mode: ecb, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_decrypt_ecb_file(args->input_path, args->output_path, key, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+    log_info("Success! Processed -> %zu bytes", out_total);
+    log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+    if (strcmp(args->mode, "cbc") == 0) {
+    log_info("Decrypt '%s' -> '%s' (mode: cbc, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_decrypt_cbc_file(args->input_path, args->output_path, key, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+    log_info("Success! Processed -> %zu bytes", out_total);
+    log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+    if (strcmp(args->mode, "cfb") == 0) {
+    log_info("Decrypt '%s' -> '%s' (mode: cfb, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_decrypt_cfb_file(args->input_path, args->output_path, key, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+    log_info("Success! Processed -> %zu bytes", out_total);
+    log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+    if (strcmp(args->mode, "ofb") == 0) {
+    log_info("Decrypt '%s' -> '%s' (mode: ofb, streaming)", args->input_path, args->output_path);
+        double mem_before_mb = get_memory_used_mb(); clock_t t_start = clock(); size_t out_total = 0;
+        int sres = stream_decrypt_ofb_file(args->input_path, args->output_path, key, &out_total);
+        clock_t t_end = clock(); double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC; double mem_after_mb = get_memory_used_mb();
+        if (sres != 0) goto cleanup; double mbps = (elapsed_sec > 0.0) ? ((double)out_total / (1024.0 * 1024.0)) / elapsed_sec : 0.0;
+    log_info("Success! Processed -> %zu bytes", out_total);
+    log_info("Time: %.3f s, Speed: %.2f MB/s, Memory: %.2f MB -> %.2f MB (Δ %.2f MB)", elapsed_sec, mbps, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
+        result = 0; goto cleanup;
+    }
+
     // Дешифрование
-    printf("Дешифрование '%s' -> '%s' (режим: %s)\n", args->input_path, args->output_path, args->mode);
+    double mem_before_mb = get_memory_used_mb();
+    clock_t t_start = clock();
+    log_info("Decrypt '%s' -> '%s' (mode: %s)", args->input_path, args->output_path, args->mode);
     
     if (strcmp(args->mode, "ecb") == 0) {
         output_data = aes_ecb_decrypt(input_data, input_size, key, &output_size);
@@ -741,7 +1492,12 @@ int decrypt_single_file(cli_args_t* args, unsigned char* key, const char* key_he
         goto cleanup;
     }
 
-    printf("Успешно! Обработано %zu байт -> %zu байт\n", input_size, output_size);
+    clock_t t_end = clock();
+    double elapsed_sec = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+    double mem_after_mb = get_memory_used_mb();
+    log_info("Success! Processed %zu bytes -> %zu bytes", input_size, output_size);
+    log_info("Time: %.3f s, Memory: %.2f MB -> %.2f MB (diff %.2f MB)",
+             elapsed_sec, mem_before_mb, mem_after_mb, mem_after_mb - mem_before_mb);
     result = 0;
 
 cleanup:
@@ -758,19 +1514,19 @@ int encrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
     int file_count;
     char** files = get_files_in_directory(args->input_path, &file_count);
     if (!files) {
-        fprintf(stderr, "Ошибка: Не удалось получить список файлов в директории '%s'\n", args->input_path);
+        fprintf(stderr, "Error: failed to list files in directory '%s'\n", args->input_path);
         return 1;
     }
 
     if (file_count == 0) {
-        printf("Директория '%s' пуста\n", args->input_path);
+        printf("Directory '%s' is empty\n", args->input_path);
         free_file_list(files, file_count);
         return 0;
     }
 
     // Создаем выходную директорию
     if (ensure_directory_exists(args->output_path) != 0) {
-        fprintf(stderr, "Ошибка: Не удалось создать выходную директорию '%s'\n", args->output_path);
+        fprintf(stderr, "Error: failed to create output directory '%s'\n", args->output_path);
         free_file_list(files, file_count);
         return 1;
     }
@@ -778,7 +1534,7 @@ int encrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
     filename_mapping_t* mappings = malloc(file_count * sizeof(filename_mapping_t));
     int success_count = 0;
 
-    printf("Найдено %d файлов для шифрования\n", file_count);
+    printf("Found %d files to encrypt\n", file_count);
 
     for (int i = 0; i < file_count; i++) {
         char input_file_path[512];
@@ -793,7 +1549,7 @@ int encrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
         // Запрашиваем новое имя файла
         char* new_name = get_new_filename(files[i]);
         if (!new_name) {
-            fprintf(stderr, "Ошибка: Не удалось получить новое имя для файла '%s'\n", files[i]);
+            fprintf(stderr, "Error: failed to get new name for file '%s'\n", files[i]);
             continue;
         }
         
@@ -817,14 +1573,18 @@ int encrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
         if (encrypt_single_file(&temp_args, key, key_hex) == 0) {
             success_count++;
         }
+        print_progress_bar(i + 1, file_count);
         
         free(new_name);
     }
 
+    // Прогресс переносом строки после бара
+    printf("\n");
+
     // Записываем метаданные
     if (success_count > 0) {
         write_metadata_file(args->output_path, mappings, success_count, key_hex);
-        printf("Зашифровано %d из %d файлов\n", success_count, file_count);
+        printf("Encrypted %d of %d files\n", success_count, file_count);
     }
 
     // Освобождаем память
@@ -845,7 +1605,7 @@ int decrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
     int file_count;
     char** files = get_files_in_directory(args->input_path, &file_count);
     if (!files) {
-        fprintf(stderr, "Ошибка: Не удалось получить список файлов в директории '%s'\n", args->input_path);
+        fprintf(stderr, "Error: failed to list files in directory '%s'\n", args->input_path);
         return 1;
     }
 
@@ -855,14 +1615,14 @@ int decrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
     filename_mapping_t* mappings = read_metadata_file(args->input_path, &mapping_count, &metadata_key_hex);
     
     if (!mappings) {
-        fprintf(stderr, "Ошибка: Не удалось прочитать метаданные из директории '%s'\n", args->input_path);
+        fprintf(stderr, "Error: failed to read metadata from directory '%s'\n", args->input_path);
         free_file_list(files, file_count);
         return 1;
     }
 
     // Проверяем ключ
     if (strcmp(key_hex, metadata_key_hex) != 0) {
-        fprintf(stderr, "Ошибка: Ключ не совпадает с ключом, использованным при шифровании\n");
+        fprintf(stderr, "Error: provided key does not match the one used for encryption\n");
         free_metadata(mappings, mapping_count, metadata_key_hex);
         free_file_list(files, file_count);
         return 1;
@@ -870,7 +1630,7 @@ int decrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
 
     // Создаем выходную директорию
     if (ensure_directory_exists(args->output_path) != 0) {
-        fprintf(stderr, "Ошибка: Не удалось создать выходную директорию '%s'\n", args->output_path);
+        fprintf(stderr, "Error: failed to create output directory '%s'\n", args->output_path);
         free_metadata(mappings, mapping_count, metadata_key_hex);
         free_file_list(files, file_count);
         return 1;
@@ -878,7 +1638,7 @@ int decrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
 
     int success_count = 0;
 
-    printf("Найдено %d зашифрованных файлов для дешифрования\n", mapping_count);
+    printf("Found %d encrypted files to decrypt\n", mapping_count);
 
     for (int i = 0; i < mapping_count; i++) {
         char input_file_path[512];
@@ -900,9 +1660,13 @@ int decrypt_directory(cli_args_t* args, unsigned char* key, const char* key_hex)
         if (decrypt_single_file(&temp_args, key, key_hex) == 0) {
             success_count++;
         }
+        print_progress_bar(i + 1, mapping_count);
     }
 
-    printf("Расшифровано %d из %d файлов\n", success_count, mapping_count);
+    // Прогресс переносом строки после бара
+    printf("\n");
+
+    printf("Decrypted %d of %d files\n", success_count, mapping_count);
 
     // Освобождаем память
     free_metadata(mappings, mapping_count, metadata_key_hex);

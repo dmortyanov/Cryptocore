@@ -12,8 +12,10 @@
 #include <time.h>
 
 #define ENTROPY_TARGET_BITS 128
-#define SAFETY_TIMEOUT_MS 15000
+#define SAFETY_TIMEOUT_MS 30000
 #define SAMPLE_INTERVAL_MS 20
+#define MIN_DISTINCT_MOVES 64
+#define MIN_DURATION_MS 5000
 
 static void mix_sample(unsigned char* buffer, size_t len, POINT* point, DWORD timestamp) {
     unsigned char sample[sizeof(POINT) + sizeof(DWORD)];
@@ -48,7 +50,7 @@ int generate_mouse_key(unsigned char* key_out, size_t key_len) {
 #ifndef _WIN32
     (void)key_out;
     (void)key_len;
-    fprintf(stderr, "Ошибка: генерация ключа по движению мыши поддерживается только в Windows.\n");
+    fprintf(stderr, "Error: Mouse key generation is only supported on Windows.\n");
     return -1;
 #else
     if (!key_out || key_len == 0) {
@@ -63,10 +65,13 @@ int generate_mouse_key(unsigned char* key_out, size_t key_len) {
     DWORD start = GetTickCount();
     DWORD collected = 0;
     size_t cursor = 0;
+    POINT last = {0};
+    int have_last = 0;
+    int distinct_moves = 0;
 
-    printf("Пожалуйста, активно двигайте мышью...\n");
+    printf("Please move the mouse actively...\n");
 
-    while (collected < ENTROPY_TARGET_BITS) {
+    while ((collected < ENTROPY_TARGET_BITS || (GetTickCount() - start) < MIN_DURATION_MS)) {
         POINT p;
         if (!GetCursorPos(&p)) {
             return -1;
@@ -79,16 +84,21 @@ int generate_mouse_key(unsigned char* key_out, size_t key_len) {
 
         mix_sample(entropy_buffer, sizeof(entropy_buffer), &p, now);
 
-        cursor = (cursor + 1) % sizeof(entropy_buffer);
-        entropy_buffer[cursor] ^= (unsigned char)(rand() & 0xFF);
+        // Count distinct mouse moves (position change) and only then credit entropy
+        if (!have_last || p.x != last.x || p.y != last.y) {
+            distinct_moves++;
+            last = p;
+            have_last = 1;
+            collected += 4; // credit entropy only on actual movement
+        }
 
         DWORD sleep_time = SAMPLE_INTERVAL_MS;
         Sleep(sleep_time);
-        collected += 4;
     }
 
-    if (collected < ENTROPY_TARGET_BITS) {
-        fprintf(stderr, "Предупреждение: собрано недостаточно энтропии мыши.\n");
+    if (collected < ENTROPY_TARGET_BITS || distinct_moves < MIN_DISTINCT_MOVES) {
+        fprintf(stderr, "Warning: insufficient mouse movement (%d moves).\n", distinct_moves);
+        return -1;
     }
 
     derive_key(entropy_buffer, sizeof(entropy_buffer), key_out, key_len);

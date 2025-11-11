@@ -24,14 +24,14 @@ unsigned char* aes_ctr_encrypt(const unsigned char* plaintext, size_t plaintext_
     // CTR - потоковый шифр, дополнение не требуется
     unsigned char* ciphertext = (unsigned char*)malloc(plaintext_len);
     if (!ciphertext) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         return NULL;
     }
 
     // Настройка ключа AES для шифрования
     AES_KEY aes_key;
     if (AES_set_encrypt_key(key, 128, &aes_key) < 0) {
-        fprintf(stderr, "Ошибка: Не удалось установить ключ шифрования AES\n");
+        fprintf(stderr, "Error: Failed to set AES encryption key\n");
         free(ciphertext);
         return NULL;
     }

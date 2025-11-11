@@ -81,8 +81,8 @@ cryptocore --algorithm aes --mode cbc --decrypt \
 ### 4. Совместимость с OpenSSL
 
  **Полная совместимость**
-- CryptoCore → OpenSSL 
-- OpenSSL → CryptoCore 
+- CryptoCore → OpenSSL ✓
+- OpenSSL → CryptoCore ✓
 - Все режимы протестированы
 
  **Тестовый скрипт:** `tests/test_openssl_compat.sh`
@@ -311,3 +311,10 @@ done
 -  Кроссплатформенная поддержка (Linux/macOS/Windows)
 
 ---
+
+##  Поддержка
+
+Для вопросов и проблем:
+1. Читайте [README.md](README.md)
+2. Проверьте [EXAMPLES.md](EXAMPLES.md)
+3. Смотрите [SPRINT2_STATUS.md](SPRINT2_STATUS.md)

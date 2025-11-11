@@ -6,17 +6,23 @@
 unsigned char* read_file(const char* filename, size_t* size) {
     FILE* file = fopen(filename, "rb");
     if (!file) {
-        fprintf(stderr, "Ошибка: Не удается открыть входной файл '%s'\n", filename);
+        fprintf(stderr, "Error: Failed to open input file '%s'\n", filename);
         return NULL;
     }
 
-    // Определение размера файла
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-    fseek(file, 0, SEEK_SET);
+    // Определение размера файла (64-bit)
+#if defined(_WIN32)
+    _fseeki64(file, 0, SEEK_END);
+    long long file_size = _ftelli64(file);
+    _fseeki64(file, 0, SEEK_SET);
+#else
+    fseeko(file, 0, SEEK_END);
+    off_t file_size = ftello(file);
+    fseeko(file, 0, SEEK_SET);
+#endif
 
     if (file_size < 0) {
-        fprintf(stderr, "Ошибка: Не удается определить размер файла '%s'\n", filename);
+        fprintf(stderr, "Error: Failed to determine file size of '%s'\n", filename);
         fclose(file);
         return NULL;
     }
@@ -24,7 +30,7 @@ unsigned char* read_file(const char* filename, size_t* size) {
     // Выделение буфера
     unsigned char* buffer = (unsigned char*)malloc(file_size);
     if (!buffer) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         fclose(file);
         return NULL;
     }
@@ -32,7 +38,7 @@ unsigned char* read_file(const char* filename, size_t* size) {
     // Чтение файла
     size_t bytes_read = fread(buffer, 1, file_size, file);
     if (bytes_read != (size_t)file_size) {
-        fprintf(stderr, "Ошибка: Не удалось прочитать весь файл '%s'\n", filename);
+        fprintf(stderr, "Error: Failed to read entire file '%s'\n", filename);
         free(buffer);
         fclose(file);
         return NULL;
@@ -46,13 +52,13 @@ unsigned char* read_file(const char* filename, size_t* size) {
 int write_file(const char* filename, const unsigned char* data, size_t size) {
     FILE* file = fopen(filename, "wb");
     if (!file) {
-        fprintf(stderr, "Ошибка: Не удается открыть выходной файл '%s'\n", filename);
+        fprintf(stderr, "Error: Failed to open output file '%s'\n", filename);
         return -1;
     }
 
     size_t bytes_written = fwrite(data, 1, size, file);
     if (bytes_written != size) {
-        fprintf(stderr, "Ошибка: Не удалось записать весь файл '%s'\n", filename);
+        fprintf(stderr, "Error: Failed to write entire file '%s'\n", filename);
         fclose(file);
         return -1;
     }

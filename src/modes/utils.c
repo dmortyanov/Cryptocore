@@ -13,13 +13,13 @@ void xor_blocks(unsigned char* output, const unsigned char* a, const unsigned ch
 unsigned char* generate_iv(void) {
     unsigned char* iv = (unsigned char*)malloc(AES_BLOCK_SIZE);
     if (!iv) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память для IV\n");
+        fprintf(stderr, "Error: Failed to allocate memory for IV\n");
         return NULL;
     }
 
     // Генерация криптографически стойкого случайного IV с использованием OpenSSL
     if (RAND_bytes(iv, AES_BLOCK_SIZE) != 1) {
-        fprintf(stderr, "Ошибка: Не удалось сгенерировать случайный IV\n");
+        fprintf(stderr, "Error: Failed to generate random IV\n");
         free(iv);
         return NULL;
     }

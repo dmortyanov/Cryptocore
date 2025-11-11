@@ -7,6 +7,7 @@ LDFLAGS = -lcrypto -lbcrypt
 # Директории
 SRC_DIR = src
 MODES_DIR = $(SRC_DIR)/modes
+HASH_DIR = $(SRC_DIR)/hash
 BUILD_DIR = build
 
 # Целевой исполняемый файл
@@ -22,7 +23,9 @@ SOURCES = main.c \
           $(MODES_DIR)/ctr.c \
           $(MODES_DIR)/utils.c \
           $(SRC_DIR)/mouse_entropy.c \
-          $(SRC_DIR)/csprng.c
+          $(SRC_DIR)/csprng.c \
+          $(HASH_DIR)/sha256.c \
+          $(HASH_DIR)/sha3.c
 
 # Объектные файлы
 OBJECTS = $(BUILD_DIR)/main.o \
@@ -34,7 +37,9 @@ OBJECTS = $(BUILD_DIR)/main.o \
           $(BUILD_DIR)/ctr.o \
           $(BUILD_DIR)/utils.o \
           $(BUILD_DIR)/mouse_entropy.o \
-          $(BUILD_DIR)/csprng.o
+          $(BUILD_DIR)/csprng.o \
+          $(BUILD_DIR)/sha256.o \
+          $(BUILD_DIR)/sha3.o
 
 # Цель по умолчанию
 all: $(BUILD_DIR) $(TARGET)
@@ -85,6 +90,14 @@ $(BUILD_DIR)/mouse_entropy.o: src/mouse_entropy.c include/mouse_entropy.h
 
 $(BUILD_DIR)/csprng.o: src/csprng.c include/csprng.h
 	$(CC) $(CFLAGS) -c src/csprng.c -o $(BUILD_DIR)/csprng.o
+
+# Компиляция sha256.c
+$(BUILD_DIR)/sha256.o: $(HASH_DIR)/sha256.c include/hash.h
+	$(CC) $(CFLAGS) -c $(HASH_DIR)/sha256.c -o $(BUILD_DIR)/sha256.o
+
+# Компиляция sha3.c
+$(BUILD_DIR)/sha3.o: $(HASH_DIR)/sha3.c include/hash.h
+	$(CC) $(CFLAGS) -c $(HASH_DIR)/sha3.c -o $(BUILD_DIR)/sha3.o
 
 # Очистка артефактов сборки
 clean:

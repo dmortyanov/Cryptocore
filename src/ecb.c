@@ -15,7 +15,7 @@ static unsigned char* apply_pkcs7_padding(const unsigned char* data, size_t data
 
     unsigned char* padded = (unsigned char*)malloc(*padded_len);
     if (!padded) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         return NULL;
     }
 
@@ -35,7 +35,7 @@ static unsigned char* apply_pkcs7_padding(const unsigned char* data, size_t data
  */
 static unsigned char* remove_pkcs7_padding(const unsigned char* data, size_t data_len, size_t* unpadded_len) {
     if (data_len == 0 || data_len % AES_BLOCK_SIZE != 0) {
-        fprintf(stderr, "Ошибка: Неверная длина шифртекста для дешифрования\n");
+        fprintf(stderr, "Error: Invalid ciphertext length for decryption\n");
         return NULL;
     }
 
@@ -44,14 +44,14 @@ static unsigned char* remove_pkcs7_padding(const unsigned char* data, size_t dat
 
     // Проверка длины дополнения
     if (padding_len == 0 || padding_len > AES_BLOCK_SIZE) {
-        fprintf(stderr, "Ошибка: Неверное дополнение PKCS#7\n");
+        fprintf(stderr, "Error: Invalid PKCS#7 padding\n");
         return NULL;
     }
 
     // Проверка корректности всех байтов дополнения
     for (size_t i = data_len - padding_len; i < data_len; i++) {
         if (data[i] != padding_len) {
-            fprintf(stderr, "Ошибка: Неверное дополнение PKCS#7\n");
+            fprintf(stderr, "Error: Invalid PKCS#7 padding\n");
             return NULL;
         }
     }
@@ -60,7 +60,7 @@ static unsigned char* remove_pkcs7_padding(const unsigned char* data, size_t dat
 
     unsigned char* unpadded = (unsigned char*)malloc(*unpadded_len);
     if (!unpadded) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         return NULL;
     }
 
@@ -80,7 +80,7 @@ unsigned char* aes_ecb_encrypt(const unsigned char* plaintext, size_t plaintext_
     // Выделение буфера для выходных данных
     unsigned char* ciphertext = (unsigned char*)malloc(padded_len);
     if (!ciphertext) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         free(padded);
         return NULL;
     }
@@ -88,7 +88,7 @@ unsigned char* aes_ecb_encrypt(const unsigned char* plaintext, size_t plaintext_
     // Настройка ключа AES
     AES_KEY aes_key;
     if (AES_set_encrypt_key(key, 128, &aes_key) < 0) {
-        fprintf(stderr, "Ошибка: Не удалось установить ключ шифрования AES\n");
+        fprintf(stderr, "Error: Failed to set AES encryption key\n");
         free(padded);
         free(ciphertext);
         return NULL;
@@ -107,21 +107,21 @@ unsigned char* aes_ecb_encrypt(const unsigned char* plaintext, size_t plaintext_
 unsigned char* aes_ecb_decrypt(const unsigned char* ciphertext, size_t ciphertext_len,
                                 const unsigned char* key, size_t* output_size) {
     if (ciphertext_len % AES_BLOCK_SIZE != 0) {
-        fprintf(stderr, "Ошибка: Длина шифртекста должна быть кратна %d байтам\n", AES_BLOCK_SIZE);
+        fprintf(stderr, "Error: Ciphertext length must be a multiple of %d bytes\n", AES_BLOCK_SIZE);
         return NULL;
     }
 
     // Выделение буфера для дешифрованных данных (с дополнением)
     unsigned char* decrypted_padded = (unsigned char*)malloc(ciphertext_len);
     if (!decrypted_padded) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         return NULL;
     }
 
     // Настройка ключа AES
     AES_KEY aes_key;
     if (AES_set_decrypt_key(key, 128, &aes_key) < 0) {
-        fprintf(stderr, "Ошибка: Не удалось установить ключ дешифрования AES\n");
+        fprintf(stderr, "Error: Failed to set AES decryption key\n");
         free(decrypted_padded);
         return NULL;
     }
@@ -143,14 +143,14 @@ unsigned char* hex_to_bytes(const char* hex_string, size_t* size) {
 
     // Проверка длины hex-строки
     if (hex_len % 2 != 0) {
-        fprintf(stderr, "Ошибка: Hex-строка должна иметь четную длину\n");
+        fprintf(stderr, "Error: Hex string must have an even length\n");
         return NULL;
     }
 
     *size = hex_len / 2;
     unsigned char* bytes = (unsigned char*)malloc(*size);
     if (!bytes) {
-        fprintf(stderr, "Ошибка: Не удалось выделить память\n");
+        fprintf(stderr, "Error: Failed to allocate memory\n");
         return NULL;
     }
 
@@ -160,7 +160,7 @@ unsigned char* hex_to_bytes(const char* hex_string, size_t* size) {
 
         // Проверка hex-символов
         if (!isxdigit(hex_byte[0]) || !isxdigit(hex_byte[1])) {
-            fprintf(stderr, "Ошибка: Недопустимый hex-символ в ключе\n");
+            fprintf(stderr, "Error: Invalid hex character in key\n");
             free(bytes);
             return NULL;
         }
