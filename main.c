@@ -5,12 +5,9 @@
 #include <stdarg.h>
 #include <time.h>
 #include <openssl/aes.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include "include/ecb.h"
 #include "include/modes.h"
 #include "include/file_io.h"
-#include "include/mouse_entropy.h"
 #include "include/csprng.h"
 #include "include/hash.h"
 
@@ -36,7 +33,6 @@ typedef struct {
     int decrypt;
     int dgst;              // Hash mode flag
     char* key_hex;
-    int use_mouse_key;
     char* iv_hex;
     char* input_path;
     char* output_path;
@@ -704,12 +700,8 @@ int validate_args(cli_args_t* args) {
         fprintf(stderr, "Error: --mode is required\n");
         return -1;
     }
-    if (args->encrypt) {
-        args->use_mouse_key = 1;  // Автоматически используем генерацию ключа по мыши при шифровании
-    }
-    
     // Sprint 3: --key теперь опциональный для шифрования
-    if (!args->key_hex && !args->use_mouse_key && !args->encrypt) {
+    if (!args->key_hex && !args->encrypt) {
         fprintf(stderr, "Error: --key is required for decryption\n");
         return -1;
     }
@@ -739,18 +731,6 @@ int validate_args(cli_args_t* args) {
         return -1;
     }
 
-    if (args->use_mouse_key) {
-#ifndef _WIN32
-        fprintf(stderr, "Error: mouse-based key generation is available only on Windows build\n");
-        return -1;
-#else
-        if (args->key_hex) {
-            fprintf(stderr, "Warning: --key is ignored when automatic key generation is enabled\n");
-            args->key_hex = NULL;
-        }
-#endif
-    }
-    
     // Проверка IV согласно Sprint 2 требованиям
     int needs_iv = mode_requires_iv(args->mode);
     
@@ -1102,32 +1082,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Генерация ключа согласно Sprint 3 требованиям
-    if (args.use_mouse_key) {
-#ifdef _WIN32
-        key = (unsigned char*)malloc(AES_128_KEY_SIZE);
-        if (!key) {
-            log_error("Error: failed to allocate memory for key");
-            goto cleanup;
-        }
-    log_info("Starting crypto utility session...");
-    log_info("Generating encryption key (mouse entropy)...");
-        if (generate_mouse_key(key, AES_128_KEY_SIZE) != 0) {
-            log_error("Error: failed to generate mouse-based key");
-            goto cleanup;
-        }
-        log_info("Key generated successfully!");
-        
-        // Преобразуем ключ в hex для сохранения
-        key_hex = malloc(AES_128_KEY_SIZE * 2 + 1);
-        for (int i = 0; i < AES_128_KEY_SIZE; i++) {
-            sprintf(key_hex + i * 2, "%02x", key[i]);
-        }
-        printf("Key (hex): %s\n", key_hex);
-#else
-        log_error("Error: mouse-based key generation is Windows-only");
-        goto cleanup;
-#endif
-    } else if (args.key_hex) {
+    if (args.key_hex) {
         // Используем предоставленный ключ
         key_hex = malloc(strlen(args.key_hex) + 1);
         strcpy(key_hex, args.key_hex);
@@ -1166,8 +1121,8 @@ int main(int argc, char* argv[]) {
         }
         
         // Print generated key (Sprint 3 requirement)
-        log_info("Generated random key: %s", key_hex);
-        } else {
+        printf("[INFO] Generated random key: %s\n", key_hex);
+    } else {
         // For decryption key is required
         log_error("Error: --key is required for decryption");
                     goto cleanup;
