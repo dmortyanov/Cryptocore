@@ -8,6 +8,7 @@ LDFLAGS = -lcrypto -lbcrypt
 SRC_DIR = src
 MODES_DIR = $(SRC_DIR)/modes
 HASH_DIR = $(SRC_DIR)/hash
+MAC_DIR = $(SRC_DIR)/mac
 BUILD_DIR = build
 
 # Целевой исполняемый файл
@@ -25,7 +26,8 @@ SOURCES = main.c \
           $(SRC_DIR)/mouse_entropy.c \
           $(SRC_DIR)/csprng.c \
           $(HASH_DIR)/sha256.c \
-          $(HASH_DIR)/sha3.c
+          $(HASH_DIR)/sha3.c \
+          $(MAC_DIR)/hmac.c
 
 # Объектные файлы
 OBJECTS = $(BUILD_DIR)/main.o \
@@ -39,7 +41,8 @@ OBJECTS = $(BUILD_DIR)/main.o \
           $(BUILD_DIR)/mouse_entropy.o \
           $(BUILD_DIR)/csprng.o \
           $(BUILD_DIR)/sha256.o \
-          $(BUILD_DIR)/sha3.o
+          $(BUILD_DIR)/sha3.o \
+          $(BUILD_DIR)/hmac.o
 
 # Цель по умолчанию
 all: $(BUILD_DIR) $(TARGET)
@@ -98,6 +101,10 @@ $(BUILD_DIR)/sha256.o: $(HASH_DIR)/sha256.c include/hash.h
 # Компиляция sha3.c
 $(BUILD_DIR)/sha3.o: $(HASH_DIR)/sha3.c include/hash.h
 	$(CC) $(CFLAGS) -c $(HASH_DIR)/sha3.c -o $(BUILD_DIR)/sha3.o
+
+# Компиляция hmac.c
+$(BUILD_DIR)/hmac.o: $(MAC_DIR)/hmac.c include/mac.h include/hash.h
+	$(CC) $(CFLAGS) -c $(MAC_DIR)/hmac.c -o $(BUILD_DIR)/hmac.o
 
 # Очистка артефактов сборки
 clean:

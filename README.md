@@ -64,7 +64,9 @@ cryptocore --algorithm АЛГОРИТМ --mode РЕЖИМ [--encrypt|--decrypt] 
 
 ### Хеширование (команда dgst)
 
-Команда для вычисления криптографических хешей файлов.
+Команда для вычисления криптографических хешей файлов и HMAC (Message Authentication Code).
+
+#### Базовое хеширование
 
 ```bash
 cryptocore dgst --algorithm АЛГОРИТМ --input ФАЙЛ [--output ВЫХОДНОЙ_ФАЙЛ]
@@ -88,7 +90,39 @@ cryptocore dgst --algorithm АЛГОРИТМ --input ФАЙЛ [--output ВЫХО
 # e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty.txt
 ```
 
-Примечание (Windows/MSYS2): файлы с кириллицей в имени могут не открываться из-за особенностей кодировок среды. Рекомендуется переименовать файл в ASCII-имя или использовать путь без не-ASCII символов.
+#### HMAC (Message Authentication Code)
+
+HMAC обеспечивает аутентификацию и целостность данных с использованием секретного ключа.
+
+```bash
+cryptocore dgst --algorithm sha256 --hmac --key КЛЮЧ --input ФАЙЛ [--verify ФАЙЛ_С_HMAC] [--output ВЫХОДНОЙ_ФАЙЛ]
+```
+
+- `--hmac`: Включает режим HMAC (требует `--key`)
+- `--key КЛЮЧ`: Ключ в виде шестнадцатеричной строки произвольной длины (обязателен при `--hmac`)
+- `--verify ФАЙЛ`: Проверяет HMAC файла против значения в указанном файле
+- Поддерживается только с алгоритмом `sha256`
+- Вывод в формате: `HMAC_ЗНАЧЕНИЕ  ПУТЬ_К_ФАЙЛУ`
+
+Примеры:
+
+```bash
+# Генерация HMAC
+./cryptocore dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt
+
+# Генерация HMAC и сохранение в файл
+./cryptocore dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt --output message.hmac
+
+# Проверка HMAC
+./cryptocore dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt --verify message.hmac
+# [OK] HMAC verification successful
+
+# Проверка с неверным ключом (должна завершиться ошибкой)
+./cryptocore dgst --algorithm sha256 --hmac --key ffeeddccbbaa99887766554433221100 --input message.txt --verify message.hmac
+# [ERROR] HMAC verification failed
+```
+
+**Примечание (Windows/MSYS2)**: файлы с кириллицей в имени могут не открываться из-за особенностей кодировок среды. Рекомендуется переименовать файл в ASCII-имя или использовать путь без не-ASCII символов.
 
 ### Обязательные аргументы
 
@@ -410,6 +444,11 @@ cryptocore/
 │   ├── ecb.c              # Реализация режима ECB
 │   ├── file_io.c          # Операции ввода-вывода файлов
 │   ├── mouse_entropy.c    # Генерация ключа по движению мыши
+│   ├── hash/              # Реализации хеш-функций
+│   │   ├── sha256.c       # SHA-256
+│   │   └── sha3.c         # SHA3-256
+│   ├── mac/               # Реализации MAC
+│   │   └── hmac.c         # HMAC (RFC 2104)
 │   └── modes/             # Реализации режимов шифрования
 │       ├── cbc.c          # Режим CBC
 │       ├── cfb.c          # Режим CFB
@@ -420,6 +459,8 @@ cryptocore/
 │   ├── ecb.h              # Объявления ECB
 │   ├── modes.h            # Объявления режимов
 │   ├── file_io.h          # Объявления ввода-вывода файлов
+│   ├── hash.h             # Объявления хеш-функций
+│   ├── mac.h              # Объявления MAC (HMAC)
 │   └── mouse_entropy.h    # Объявления генерации ключа
 ├── tests/                 # Тестовые файлы и скрипты
 │   ├── run_tests.sh       # Автоматизированный тестовый скрипт

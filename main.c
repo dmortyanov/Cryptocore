@@ -10,12 +10,14 @@
 #include "include/file_io.h"
 #include "include/csprng.h"
 #include "include/hash.h"
+#include "include/mac.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
 #include <io.h>
 #include <direct.h>
+#include <sys/stat.h>
 #define stat _stat
 #ifndef S_ISDIR
 #define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
@@ -32,7 +34,9 @@ typedef struct {
     int encrypt;
     int decrypt;
     int dgst;              // Hash mode flag
+    int hmac;              // HMAC mode flag
     char* key_hex;
+    char* verify_path;     // Path to HMAC file for verification
     char* iv_hex;
     char* input_path;
     char* output_path;
@@ -601,12 +605,19 @@ void print_usage(const char* program_name) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Optional:\n");
     fprintf(stderr, "  --output FILE          Write hash to file instead of stdout\n");
+    fprintf(stderr, "  --hmac                 Enable HMAC mode (requires --key)\n");
+    fprintf(stderr, "  --key KEY              Key for HMAC (hex string, arbitrary length, required with --hmac)\n");
+    fprintf(stderr, "  --verify FILE          Verify HMAC against value in file\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  Compute SHA-256 hash:\n");
     fprintf(stderr, "    %s dgst --algorithm sha256 --input document.pdf\n\n", program_name);
     fprintf(stderr, "  Compute SHA3-256 hash and save to file:\n");
-    fprintf(stderr, "    %s dgst --algorithm sha3-256 --input backup.tar --output backup.sha3\n", program_name);
+    fprintf(stderr, "    %s dgst --algorithm sha3-256 --input backup.tar --output backup.sha3\n\n", program_name);
+    fprintf(stderr, "  Generate HMAC:\n");
+    fprintf(stderr, "    %s dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt\n\n", program_name);
+    fprintf(stderr, "  Verify HMAC:\n");
+    fprintf(stderr, "    %s dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt --verify expected_hmac.txt\n", program_name);
 }
 
 /**
@@ -668,6 +679,14 @@ int parse_args(int argc, char* argv[], cli_args_t* args) {
                 return -1;
             }
             args->output_path = argv[++i];
+        } else if (strcmp(argv[i], "--hmac") == 0) {
+            args->hmac = 1;
+        } else if (strcmp(argv[i], "--verify") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: --verify requires an argument\n");
+                return -1;
+            }
+            args->verify_path = argv[++i];
         } else {
             fprintf(stderr, "Error: Unknown argument '%s'\n", argv[i]);
             return -1;
@@ -992,10 +1011,52 @@ void free_metadata(filename_mapping_t* mappings, int count, char* key_hex) {
 }
 
 /**
- * Handle dgst command for computing file hashes
+ * Read expected HMAC from file (flexible parsing)
+ * Returns 0 on success, -1 on error
+ */
+static int read_expected_hmac(const char* filepath, char* hmac_out) {
+    FILE* f = fopen(filepath, "r");
+    char line[256];
+    
+    if (!f) {
+        fprintf(stderr, "Error: Failed to open HMAC file '%s'\n", filepath);
+        return -1;
+    }
+    
+    if (!fgets(line, sizeof(line), f)) {
+        fprintf(stderr, "Error: Failed to read from HMAC file '%s'\n", filepath);
+        fclose(f);
+        return -1;
+    }
+    
+    fclose(f);
+    
+    // Parse HMAC value (first 64 hex characters, ignore whitespace and filename)
+    size_t i, j = 0;
+    for (i = 0; i < strlen(line) && j < 64; i++) {
+        if ((line[i] >= '0' && line[i] <= '9') || 
+            (line[i] >= 'a' && line[i] <= 'f') || 
+            (line[i] >= 'A' && line[i] <= 'F')) {
+            hmac_out[j++] = line[i];
+        }
+    }
+    
+    if (j != 64) {
+        fprintf(stderr, "Error: Invalid HMAC format in file '%s'\n", filepath);
+        return -1;
+    }
+    
+    hmac_out[64] = '\0';
+    return 0;
+}
+
+/**
+ * Handle dgst command for computing file hashes and HMACs
  */
 int handle_dgst_command(cli_args_t* args) {
     uint8_t hash[32];
+    uint8_t* key_bytes = NULL;
+    size_t key_size = 0;
     char hex_hash[65];
     
     // Validate arguments
@@ -1009,26 +1070,84 @@ int handle_dgst_command(cli_args_t* args) {
         return 1;
     }
     
-    // Compute hash based on algorithm
-    int hash_result = -1;
-    if (strcmp(args->algorithm, "sha256") == 0) {
-        hash_result = sha256_hash_file(args->input_path, hash);
-    } else if (strcmp(args->algorithm, "sha3-256") == 0) {
-        hash_result = sha3_256_hash_file(args->input_path, hash);
+    // HMAC mode validation
+    if (args->hmac) {
+        if (!args->key_hex) {
+            fprintf(stderr, "Error: --key is required when --hmac is specified\n");
+            return 1;
+        }
+        
+        // Only SHA-256 is supported for HMAC (as per requirements)
+        if (strcmp(args->algorithm, "sha256") != 0) {
+            fprintf(stderr, "Error: HMAC is only supported with sha256 algorithm\n");
+            return 1;
+        }
+        
+        // Convert key from hex
+        key_bytes = hex_to_bytes(args->key_hex, &key_size);
+        if (!key_bytes) {
+            fprintf(stderr, "Error: Invalid key format\n");
+            return 1;
+        }
+        
+        // Compute HMAC
+        if (hmac_file(args->input_path, key_bytes, key_size, hash) != 0) {
+            free(key_bytes);
+            return 1;
+        }
+        
+        free(key_bytes);
     } else {
-        fprintf(stderr, "Error: Unsupported hash algorithm '%s'\n", args->algorithm);
-        fprintf(stderr, "Supported: sha256, sha3-256\n");
-        return 1;
-    }
-    
-    // Check if hashing was successful
-    if (hash_result != 0) {
-        return 1;
+        // Regular hash computation
+        int hash_result = -1;
+        if (strcmp(args->algorithm, "sha256") == 0) {
+            hash_result = sha256_hash_file(args->input_path, hash);
+        } else if (strcmp(args->algorithm, "sha3-256") == 0) {
+            hash_result = sha3_256_hash_file(args->input_path, hash);
+        } else {
+            fprintf(stderr, "Error: Unsupported hash algorithm '%s'\n", args->algorithm);
+            fprintf(stderr, "Supported: sha256, sha3-256\n");
+            return 1;
+        }
+        
+        if (hash_result != 0) {
+            return 1;
+        }
     }
     
     hash_to_hex(hash, 32, hex_hash);
     
-    // Output hash
+    // Verification mode
+    if (args->verify_path) {
+        char expected_hmac[65];
+        if (read_expected_hmac(args->verify_path, expected_hmac) != 0) {
+            return 1;
+        }
+        
+        // Compare HMACs (case-insensitive)
+        int match = 1;
+        for (int i = 0; i < 64; i++) {
+            char c1 = hex_hash[i];
+            char c2 = expected_hmac[i];
+            // Convert to lowercase for comparison
+            if (c1 >= 'A' && c1 <= 'F') c1 = c1 - 'A' + 'a';
+            if (c2 >= 'A' && c2 <= 'F') c2 = c2 - 'A' + 'a';
+            if (c1 != c2) {
+                match = 0;
+                break;
+            }
+        }
+        
+        if (match) {
+            printf("[OK] HMAC verification successful\n");
+            return 0;
+        } else {
+            fprintf(stderr, "[ERROR] HMAC verification failed\n");
+            return 1;
+        }
+    }
+    
+    // Output hash/HMAC
     if (args->output_path) {
         // Write to file
         FILE* f = fopen(args->output_path, "w");
