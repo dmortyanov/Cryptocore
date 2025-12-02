@@ -78,7 +78,32 @@ cd tests
 ./test_csprng_uniqueness.sh
 ```
 
-## 4. Ручное тестирование
+## 4. Шифрование/дешифрование директорий
+
+### Шифрование всей директории files/
+
+```bash
+# С автогенерацией ключа (рекомендуется)
+./cryptocore --algorithm aes --mode cbc --encrypt \
+  --input ./files \
+  --output ./encryptfiles
+
+# Сохраните ключ из вывода! Он понадобится для дешифрования.
+```
+
+### Дешифрование директории
+
+```bash
+# Используйте ключ, который был выведен при шифровании
+./cryptocore --algorithm aes --mode cbc --decrypt \
+  --key <ВАШ_КЛЮЧ> \
+  --input ./encryptfiles \
+  --output ./decryptfiles
+```
+
+**Подробное руководство:** См. `tests/DIRECTORY_ENCRYPTION_GUIDE.md`
+
+## 5. Ручное тестирование
 
 ### Пример 1: Шифрование/дешифрование ECB
 ```bash

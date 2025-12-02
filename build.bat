@@ -127,8 +127,16 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+echo Компиляция src\mac\cmac.c...
+gcc -Wall -Wextra -O2 -I. -D__USE_MINGW_ANSI_STDIO=1 -finput-charset=UTF-8 -fexec-charset=UTF-8 -c src\mac\cmac.c -o build\cmac.o
+if %ERRORLEVEL% NEQ 0 (
+    echo Ошибка: Не удалось скомпилировать src\mac\cmac.c
+    pause
+    exit /b 1
+)
+
 echo Линковка...
-gcc build\main.o build\ecb.o build\file_io.o build\cbc.o build\cfb.o build\ofb.o build\ctr.o build\utils.o build\mouse_entropy.o build\csprng.o build\sha256.o build\sha3.o build\hmac.o -o cryptocore.exe -lcrypto -lbcrypt
+gcc build\main.o build\ecb.o build\file_io.o build\cbc.o build\cfb.o build\ofb.o build\ctr.o build\utils.o build\mouse_entropy.o build\csprng.o build\sha256.o build\sha3.o build\hmac.o build\cmac.o -o cryptocore.exe -lcrypto -lbcrypt
 if %ERRORLEVEL% NEQ 0 (
     echo Ошибка: Не удалось выполнить линковку. Убедитесь, что OpenSSL установлен.
     echo.

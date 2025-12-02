@@ -27,7 +27,8 @@ SOURCES = main.c \
           $(SRC_DIR)/csprng.c \
           $(HASH_DIR)/sha256.c \
           $(HASH_DIR)/sha3.c \
-          $(MAC_DIR)/hmac.c
+          $(MAC_DIR)/hmac.c \
+          $(MAC_DIR)/cmac.c
 
 # Объектные файлы
 OBJECTS = $(BUILD_DIR)/main.o \
@@ -42,7 +43,8 @@ OBJECTS = $(BUILD_DIR)/main.o \
           $(BUILD_DIR)/csprng.o \
           $(BUILD_DIR)/sha256.o \
           $(BUILD_DIR)/sha3.o \
-          $(BUILD_DIR)/hmac.o
+          $(BUILD_DIR)/hmac.o \
+          $(BUILD_DIR)/cmac.o
 
 # Цель по умолчанию
 all: $(BUILD_DIR) $(TARGET)
@@ -105,6 +107,10 @@ $(BUILD_DIR)/sha3.o: $(HASH_DIR)/sha3.c include/hash.h
 # Компиляция hmac.c
 $(BUILD_DIR)/hmac.o: $(MAC_DIR)/hmac.c include/mac.h include/hash.h
 	$(CC) $(CFLAGS) -c $(MAC_DIR)/hmac.c -o $(BUILD_DIR)/hmac.o
+
+# Компиляция cmac.c
+$(BUILD_DIR)/cmac.o: $(MAC_DIR)/cmac.c include/mac.h
+	$(CC) $(CFLAGS) -c $(MAC_DIR)/cmac.c -o $(BUILD_DIR)/cmac.o
 
 # Очистка артефактов сборки
 clean:

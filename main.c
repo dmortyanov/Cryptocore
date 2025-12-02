@@ -35,8 +35,9 @@ typedef struct {
     int decrypt;
     int dgst;              // Hash mode flag
     int hmac;              // HMAC mode flag
+    int cmac;              // AES-CMAC mode flag
     char* key_hex;
-    char* verify_path;     // Path to HMAC file for verification
+    char* verify_path;     // Path to HMAC/CMAC file for verification
     char* iv_hex;
     char* input_path;
     char* output_path;
@@ -606,8 +607,9 @@ void print_usage(const char* program_name) {
     fprintf(stderr, "Optional:\n");
     fprintf(stderr, "  --output FILE          Write hash to file instead of stdout\n");
     fprintf(stderr, "  --hmac                 Enable HMAC mode (requires --key)\n");
-    fprintf(stderr, "  --key KEY              Key for HMAC (hex string, arbitrary length, required with --hmac)\n");
-    fprintf(stderr, "  --verify FILE          Verify HMAC against value in file\n");
+    fprintf(stderr, "  --cmac                 Enable AES-CMAC mode (requires --key, 32 hex chars for AES-128)\n");
+    fprintf(stderr, "  --key KEY              Key for HMAC/CMAC (hex string, arbitrary length for HMAC, 32 chars for CMAC)\n");
+    fprintf(stderr, "  --verify FILE          Verify HMAC/CMAC against value in file\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  Compute SHA-256 hash:\n");
@@ -616,7 +618,9 @@ void print_usage(const char* program_name) {
     fprintf(stderr, "    %s dgst --algorithm sha3-256 --input backup.tar --output backup.sha3\n\n", program_name);
     fprintf(stderr, "  Generate HMAC:\n");
     fprintf(stderr, "    %s dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt\n\n", program_name);
-    fprintf(stderr, "  Verify HMAC:\n");
+    fprintf(stderr, "  Generate AES-CMAC:\n");
+    fprintf(stderr, "    %s dgst --cmac --key 2b7e151628aed2a6abf7158809cf4f3c --input message.txt\n\n", program_name);
+    fprintf(stderr, "  Verify HMAC/CMAC:\n");
     fprintf(stderr, "    %s dgst --algorithm sha256 --hmac --key 00112233445566778899aabbccddeeff --input message.txt --verify expected_hmac.txt\n", program_name);
 }
 
@@ -681,6 +685,8 @@ int parse_args(int argc, char* argv[], cli_args_t* args) {
             args->output_path = argv[++i];
         } else if (strcmp(argv[i], "--hmac") == 0) {
             args->hmac = 1;
+        } else if (strcmp(argv[i], "--cmac") == 0) {
+            args->cmac = 1;
         } else if (strcmp(argv[i], "--verify") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Error: --verify requires an argument\n");
@@ -1011,42 +1017,43 @@ void free_metadata(filename_mapping_t* mappings, int count, char* key_hex) {
 }
 
 /**
- * Read expected HMAC from file (flexible parsing)
+ * Read expected MAC (HMAC or CMAC) from file (flexible parsing)
  * Returns 0 on success, -1 on error
+ * Reads up to max_len hex characters (64 for HMAC, 32 for CMAC)
  */
-static int read_expected_hmac(const char* filepath, char* hmac_out) {
+static int read_expected_mac(const char* filepath, char* mac_out, int max_len) {
     FILE* f = fopen(filepath, "r");
     char line[256];
     
     if (!f) {
-        fprintf(stderr, "Error: Failed to open HMAC file '%s'\n", filepath);
+        fprintf(stderr, "Error: Failed to open MAC file '%s'\n", filepath);
         return -1;
     }
     
     if (!fgets(line, sizeof(line), f)) {
-        fprintf(stderr, "Error: Failed to read from HMAC file '%s'\n", filepath);
+        fprintf(stderr, "Error: Failed to read from MAC file '%s'\n", filepath);
         fclose(f);
         return -1;
     }
     
     fclose(f);
     
-    // Parse HMAC value (first 64 hex characters, ignore whitespace and filename)
+    // Parse MAC value (first max_len hex characters, ignore whitespace and filename)
     size_t i, j = 0;
-    for (i = 0; i < strlen(line) && j < 64; i++) {
+    for (i = 0; i < strlen(line) && j < max_len; i++) {
         if ((line[i] >= '0' && line[i] <= '9') || 
             (line[i] >= 'a' && line[i] <= 'f') || 
             (line[i] >= 'A' && line[i] <= 'F')) {
-            hmac_out[j++] = line[i];
+            mac_out[j++] = line[i];
         }
     }
     
-    if (j != 64) {
-        fprintf(stderr, "Error: Invalid HMAC format in file '%s'\n", filepath);
+    if (j != max_len) {
+        fprintf(stderr, "Error: Invalid MAC format in file '%s' (expected %d hex characters, got %zu)\n", filepath, max_len, j);
         return -1;
     }
     
-    hmac_out[64] = '\0';
+    mac_out[max_len] = '\0';
     return 0;
 }
 
@@ -1070,33 +1077,66 @@ int handle_dgst_command(cli_args_t* args) {
         return 1;
     }
     
-    // HMAC mode validation
-    if (args->hmac) {
+    // HMAC/CMAC mode validation
+    if (args->hmac || args->cmac) {
         if (!args->key_hex) {
-            fprintf(stderr, "Error: --key is required when --hmac is specified\n");
+            fprintf(stderr, "Error: --key is required when --hmac or --cmac is specified\n");
             return 1;
         }
         
-        // Only SHA-256 is supported for HMAC (as per requirements)
-        if (strcmp(args->algorithm, "sha256") != 0) {
-            fprintf(stderr, "Error: HMAC is only supported with sha256 algorithm\n");
+        if (args->hmac && args->cmac) {
+            fprintf(stderr, "Error: --hmac and --cmac cannot be used together\n");
             return 1;
         }
         
-        // Convert key from hex
-        key_bytes = hex_to_bytes(args->key_hex, &key_size);
-        if (!key_bytes) {
-            fprintf(stderr, "Error: Invalid key format\n");
-            return 1;
-        }
-        
-        // Compute HMAC
-        if (hmac_file(args->input_path, key_bytes, key_size, hash) != 0) {
+        if (args->hmac) {
+            // Only SHA-256 is supported for HMAC (as per requirements)
+            if (strcmp(args->algorithm, "sha256") != 0) {
+                fprintf(stderr, "Error: HMAC is only supported with sha256 algorithm\n");
+                return 1;
+            }
+            
+            // Convert key from hex
+            key_bytes = hex_to_bytes(args->key_hex, &key_size);
+            if (!key_bytes) {
+                fprintf(stderr, "Error: Invalid key format\n");
+                return 1;
+            }
+            
+            // Compute HMAC
+            if (hmac_file(args->input_path, key_bytes, key_size, hash) != 0) {
+                free(key_bytes);
+                return 1;
+            }
+            
             free(key_bytes);
-            return 1;
+        } else if (args->cmac) {
+            // CMAC requires AES-128 key (32 hex characters = 16 bytes)
+            key_bytes = hex_to_bytes(args->key_hex, &key_size);
+            if (!key_bytes) {
+                fprintf(stderr, "Error: Invalid key format\n");
+                return 1;
+            }
+            
+            if (key_size != 16) {
+                fprintf(stderr, "Error: CMAC requires AES-128 key (32 hex characters = 16 bytes)\n");
+                free(key_bytes);
+                return 1;
+            }
+            
+            // Compute CMAC (16 bytes)
+            uint8_t cmac_result[16];
+            if (cmac_file(args->input_path, key_bytes, cmac_result) != 0) {
+                free(key_bytes);
+                return 1;
+            }
+            
+            // Copy CMAC to hash buffer (for consistent handling)
+            memcpy(hash, cmac_result, 16);
+            memset(hash + 16, 0, 16);  // Zero out remaining bytes
+            
+            free(key_bytes);
         }
-        
-        free(key_bytes);
     } else {
         // Regular hash computation
         int hash_result = -1;
@@ -1115,20 +1155,25 @@ int handle_dgst_command(cli_args_t* args) {
         }
     }
     
-    hash_to_hex(hash, 32, hex_hash);
+    // Determine output length based on mode
+    int mac_len = (args->cmac) ? 16 : 32;
+    hash_to_hex(hash, mac_len, hex_hash);
+    hex_hash[mac_len * 2] = '\0';  // Ensure null termination
     
     // Verification mode
     if (args->verify_path) {
-        char expected_hmac[65];
-        if (read_expected_hmac(args->verify_path, expected_hmac) != 0) {
+        char expected_mac[65];
+        int expected_len = (args->cmac) ? 32 : 64;
+        
+        if (read_expected_mac(args->verify_path, expected_mac, expected_len) != 0) {
             return 1;
         }
         
-        // Compare HMACs (case-insensitive)
+        // Compare MACs (case-insensitive)
         int match = 1;
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < expected_len; i++) {
             char c1 = hex_hash[i];
-            char c2 = expected_hmac[i];
+            char c2 = expected_mac[i];
             // Convert to lowercase for comparison
             if (c1 >= 'A' && c1 <= 'F') c1 = c1 - 'A' + 'a';
             if (c2 >= 'A' && c2 <= 'F') c2 = c2 - 'A' + 'a';
@@ -1139,10 +1184,18 @@ int handle_dgst_command(cli_args_t* args) {
         }
         
         if (match) {
-            printf("[OK] HMAC verification successful\n");
+            if (args->cmac) {
+                printf("[OK] CMAC verification successful\n");
+            } else {
+                printf("[OK] HMAC verification successful\n");
+            }
             return 0;
         } else {
-            fprintf(stderr, "[ERROR] HMAC verification failed\n");
+            if (args->cmac) {
+                fprintf(stderr, "[ERROR] CMAC verification failed\n");
+            } else {
+                fprintf(stderr, "[ERROR] HMAC verification failed\n");
+            }
             return 1;
         }
     }
@@ -1155,11 +1208,11 @@ int handle_dgst_command(cli_args_t* args) {
             fprintf(stderr, "Error: Failed to open output file '%s'\n", args->output_path);
             return 1;
         }
-        fprintf(f, "%s  %s\n", hex_hash, args->input_path);
+        fprintf(f, "%s %s\n", hex_hash, args->input_path);
         fclose(f);
     } else {
         // Print to stdout
-        printf("%s  %s\n", hex_hash, args->input_path);
+        printf("%s %s\n", hex_hash, args->input_path);
     }
 
     return 0;
